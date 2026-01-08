@@ -12,7 +12,7 @@ class PageConfig:
     data_path: str  # JSONPath-like path to extract from __NEXT_DATA__
     
 PAGES_TO_TRACK = [
-    # === Site 1 (Main English site) ===
+    # === Site 1 ===
     PageConfig(
         name="Site1-Home",
         url="https://drjoedispenza.com/",
@@ -38,8 +38,13 @@ PAGES_TO_TRACK = [
         url="https://drjoedispenza.com/dr-joe-live",
         data_path="props.pageProps"
     ),
+    PageConfig(
+        name="Site1-Support",
+        url="https://support.drjoedispenza.com/",
+        data_path="props.pageProps"
+    ),
     
-    # === Site 2 (German shop) ===
+    # === Site 2 ===
     PageConfig(
         name="Site2-Home",
         url="https://drjoedispenza.info/s/Drjoedispenza",
@@ -60,6 +65,23 @@ PAGES_TO_TRACK = [
         url="https://drjoedispenza.info/s/Drjoedispenza/blog",
         data_path="props.pageProps"
     ),
+    
+    # === Site 4 ===
+    PageConfig(name="Site4-Home", url="https://metamorphllc.net/", data_path="props.pageProps"),
+    
+    # === Site 5 ===
+    PageConfig(name="Site5-Home", url="https://innerscienceresearch.org/", data_path="props.pageProps"),
+    PageConfig(name="Site5-About", url="https://innerscienceresearch.org/about/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Research", url="https://innerscienceresearch.org/research/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Explore", url="https://innerscienceresearch.org/explore/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Events", url="https://innerscienceresearch.org/join-us/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Donate", url="https://innerscienceresearch.org/donate/", data_path="props.pageProps"),
+    PageConfig(name="Site5-FAQ", url="https://innerscienceresearch.org/faq/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Partners", url="https://innerscienceresearch.org/shared-mission-organizations/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Stream", url="https://innerscienceresearch.org/stream/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Invitations", url="https://innerscienceresearch.org/invitations/", data_path="props.pageProps"),
+    PageConfig(name="Site5-Live", url="https://innerscienceresearch.org/live/", data_path="props.pageProps"),
+    PageConfig(name="Site5-CatalystBusiness", url="https://innerscienceresearch.org/global-catalyst-business/", data_path="props.pageProps"),
 ]
 
 # Discord Webhook URL - set via environment variable

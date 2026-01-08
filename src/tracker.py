@@ -219,17 +219,25 @@ def track_page(page: PageConfig) -> bool:
         print(f"⚠️  Could not fetch {page.name}")
         return False
     
-    # Extract Next.js data
+    # Try to extract Next.js data, fall back to HTML content if not available
     next_data = extract_next_data(html)
-    if not next_data:
-        print(f"⚠️  No __NEXT_DATA__ found on {page.name}")
-        return False
-    
-    # Get the specific data we care about
-    page_data = get_nested_value(next_data, page.data_path)
-    if page_data is None:
-        print(f"⚠️  Could not find data at path '{page.data_path}'")
-        page_data = next_data  # Fall back to full data
+    if next_data:
+        # Get the specific data we care about
+        page_data = get_nested_value(next_data, page.data_path)
+        if page_data is None:
+            print(f"⚠️  Could not find data at path '{page.data_path}'")
+            page_data = next_data  # Fall back to full data
+    else:
+        # No Next.js data - use HTML content hash for tracking
+        print(f"ℹ️  No __NEXT_DATA__ on {page.name} - using HTML tracking")
+        # Extract just the body content to reduce noise from headers/scripts
+        import re as regex
+        body_match = regex.search(r'<body[^>]*>(.*?)</body>', html, regex.DOTALL | regex.IGNORECASE)
+        body_content = body_match.group(1) if body_match else html
+        # Remove scripts and styles to focus on content
+        body_content = regex.sub(r'<script[^>]*>.*?</script>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
+        body_content = regex.sub(r'<style[^>]*>.*?</style>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
+        page_data = {"_html_hash": hashlib.md5(body_content.encode()).hexdigest(), "_content_length": len(body_content)}
     
     # Load previous snapshot
     old_snapshot = load_snapshot(page.name)
@@ -443,6 +451,80 @@ def track_build_manifest_site2() -> bool:
     return False
 
 
+def track_sitemap_site5() -> bool:
+    """Track WordPress XML sitemaps for Site5 to detect new pages."""
+    print("\n📡 Tracking: Site5 XML Sitemaps")
+    
+    # List of all Site5 sitemaps to track
+    sitemap_urls = [
+        "https://innerscienceresearch.org/wp-sitemap-posts-page-1.xml",
+        "https://innerscienceresearch.org/wp-sitemap-posts-post-1.xml",
+        "https://innerscienceresearch.org/wp-sitemap-posts-sdm_downloads-1.xml",
+        "https://innerscienceresearch.org/wp-sitemap-taxonomies-category-1.xml",
+    ]
+    
+    all_urls = set()
+    
+    # Fetch all sitemaps and extract URLs
+    for sitemap_url in sitemap_urls:
+        content = fetch_page(sitemap_url)
+        if content:
+            # Extract URLs from XML
+            import re as regex
+            urls = regex.findall(r'<loc>(https?://[^<]+)</loc>', content)
+            all_urls.update(urls)
+    
+    print(f"📊 Found {len(all_urls)} total URLs in Site5 sitemaps")
+    
+    # Load previous snapshot
+    old_snapshot = load_snapshot("sitemap_site5")
+    
+    current_data = {
+        "urls": sorted(list(all_urls)),
+        "count": len(all_urls),
+        "hash": hashlib.md5(str(sorted(all_urls)).encode()).hexdigest()
+    }
+    
+    if old_snapshot is None:
+        print(f"📝 First Site5 sitemap snapshot ({len(all_urls)} URLs)")
+        save_snapshot("sitemap_site5", current_data)
+        return False
+    
+    old_data = old_snapshot.get("data", {})
+    old_urls = set(old_data.get("urls", []))
+    
+    # Check for new/removed URLs
+    new_urls = all_urls - old_urls
+    removed_urls = old_urls - all_urls
+    
+    changes_detected = False
+    
+    if new_urls:
+        print(f"🆕 New Site5 pages detected: {len(new_urls)}")
+        for url in list(new_urls)[:5]:
+            print(f"   + {url}")
+        changes_detected = True
+        
+        if DISCORD_WEBHOOK_URL:
+            send_build_change_notification(
+                DISCORD_WEBHOOK_URL,
+                f"Site5: {len(old_urls)} pages",
+                f"Site5: {len(all_urls)} pages (+{len(new_urls)} new)",
+                sorted(list(new_urls))[:10]
+            )
+    
+    if removed_urls:
+        print(f"🗑️ Removed Site5 pages: {len(removed_urls)}")
+        changes_detected = True
+    
+    if changes_detected:
+        save_snapshot("sitemap_site5", current_data)
+        return True
+    
+    print("✅ No Site5 sitemap changes")
+    return False
+
+
 def main():
     """Main entry point."""
     print("=" * 60)
@@ -494,6 +576,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking Site2 build manifest: {e}")
+    
+    # Track XML sitemaps for Site5 (WordPress - detects new pages)
+    try:
+        if track_sitemap_site5():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error tracking Site5 sitemaps: {e}")
     
     print("\n" + "=" * 60)
     if changes_detected:
