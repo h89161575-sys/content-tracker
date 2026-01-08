@@ -364,6 +364,85 @@ def track_build_manifest() -> bool:
     return False
 
 
+def track_build_manifest_site2() -> bool:
+    """Track the build manifest for Site2 (German shop)."""
+    print("\n📡 Tracking: Site2 Build Manifest")
+    
+    # Get current build ID from Site2 homepage
+    html = fetch_page("https://drjoedispenza.info/s/Drjoedispenza")
+    if not html:
+        return False
+    
+    next_data = extract_next_data(html)
+    if not next_data:
+        return False
+    
+    build_id = next_data.get("buildId")
+    if not build_id:
+        print("⚠️  Could not find buildId for Site2")
+        return False
+    
+    print(f"📦 Site2 buildId: {build_id}")
+    
+    # Extract shopPages from the NEXT_DATA (contains all registered pages)
+    page_props = get_nested_value(next_data, "props.pageProps")
+    shop_pages = []
+    if page_props:
+        # Try to find shopPages or similar sitemap data
+        initial_data = page_props.get("initialData", {})
+        content_store = initial_data.get("contentPageStore", {})
+        shop_pages = content_store.get("shopPages", [])
+        if not shop_pages:
+            # Fallback: extract all slugs from the data
+            shop_pages = content_store.get("allSlugs", [])
+    
+    # Load previous snapshot
+    old_snapshot = load_snapshot("build_manifest_site2")
+    
+    current_data = {
+        "buildId": build_id,
+        "shopPages": sorted([str(p) for p in shop_pages]) if shop_pages else [],
+        "pageCount": len(shop_pages) if shop_pages else 0
+    }
+    
+    if old_snapshot is None:
+        print(f"📝 First Site2 build manifest snapshot ({current_data['pageCount']} pages)")
+        save_snapshot("build_manifest_site2", current_data)
+        return False
+    
+    old_data = old_snapshot.get("data", {})
+    old_build_id = old_data.get("buildId", "")
+    old_pages = set(old_data.get("shopPages", []))
+    new_pages = set(current_data.get("shopPages", []))
+    
+    changes_detected = False
+    
+    # Check for new pages
+    added_pages = new_pages - old_pages
+    if added_pages:
+        print(f"🆕 New Site2 pages: {added_pages}")
+        changes_detected = True
+        if DISCORD_WEBHOOK_URL:
+            send_build_change_notification(
+                DISCORD_WEBHOOK_URL,
+                f"Site2: {len(old_pages)} pages",
+                f"Site2: {len(new_pages)} pages",
+                sorted(list(added_pages))[:10]  # Limit to 10
+            )
+    
+    # Check for build ID change
+    if old_build_id != build_id:
+        print(f"🔄 Site2 Build ID changed")
+        changes_detected = True
+    
+    if changes_detected:
+        save_snapshot("build_manifest_site2", current_data)
+        return True
+    
+    print("✅ No Site2 build changes")
+    return False
+
+
 def main():
     """Main entry point."""
     print("=" * 60)
@@ -402,12 +481,19 @@ def main():
         except Exception as e:
             print(f"❌ Error tracking {page.name}: {e}")
     
-    # Track build manifest
+    # Track build manifest for Site1
     try:
         if track_build_manifest():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking build manifest: {e}")
+    
+    # Track build manifest for Site2
+    try:
+        if track_build_manifest_site2():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error tracking Site2 build manifest: {e}")
     
     print("\n" + "=" * 60)
     if changes_detected:
