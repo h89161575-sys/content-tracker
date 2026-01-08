@@ -525,6 +525,79 @@ def track_sitemap_site5() -> bool:
     return False
 
 
+def track_sitemap_site4() -> bool:
+    """Track WordPress XML sitemaps for Site4 to detect new pages."""
+    print("\n📡 Tracking: Site4 XML Sitemaps")
+    
+    sitemap_url = "https://metamorphllc.net/wp-sitemap.xml"
+    content = fetch_page(sitemap_url)
+    
+    if not content:
+        print("⚠️  Could not fetch Site4 sitemap")
+        return False
+    
+    # Extract all sitemap URLs from index
+    import re as regex
+    sub_sitemaps = regex.findall(r'<loc>(https?://[^<]+\.xml)</loc>', content)
+    
+    all_urls = set()
+    
+    # Fetch each sub-sitemap and extract page URLs
+    for sub_sitemap in sub_sitemaps:
+        sub_content = fetch_page(sub_sitemap)
+        if sub_content:
+            urls = regex.findall(r'<loc>(https?://[^<]+)</loc>', sub_content)
+            # Filter out .xml files to get actual page URLs
+            page_urls = [u for u in urls if not u.endswith('.xml')]
+            all_urls.update(page_urls)
+    
+    print(f"📊 Found {len(all_urls)} total URLs in Site4 sitemaps")
+    
+    # Load previous snapshot
+    old_snapshot = load_snapshot("sitemap_site4")
+    
+    current_data = {
+        "urls": sorted(list(all_urls)),
+        "count": len(all_urls),
+        "hash": hashlib.md5(str(sorted(all_urls)).encode()).hexdigest()
+    }
+    
+    if old_snapshot is None:
+        print(f"📝 First Site4 sitemap snapshot ({len(all_urls)} URLs)")
+        save_snapshot("sitemap_site4", current_data)
+        return False
+    
+    old_data = old_snapshot.get("data", {})
+    old_urls = set(old_data.get("urls", []))
+    
+    new_urls = all_urls - old_urls
+    removed_urls = old_urls - all_urls
+    
+    changes_detected = False
+    
+    if new_urls:
+        print(f"🆕 New Site4 pages detected: {len(new_urls)}")
+        changes_detected = True
+        if DISCORD_WEBHOOK_URL:
+            send_build_change_notification(
+                DISCORD_WEBHOOK_URL,
+                f"Site4: {len(old_urls)} pages",
+                f"Site4: {len(all_urls)} pages (+{len(new_urls)} new)",
+                sorted(list(new_urls))[:10]
+            )
+    
+    if removed_urls:
+        print(f"🗑️ Removed Site4 pages: {len(removed_urls)}")
+        changes_detected = True
+    
+    if changes_detected:
+        save_snapshot("sitemap_site4", current_data)
+        return True
+    
+    print("✅ No Site4 sitemap changes")
+    return False
+
+
 def main():
     """Main entry point."""
     print("=" * 60)
@@ -576,6 +649,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking Site2 build manifest: {e}")
+    
+    # Track XML sitemaps for Site4 (WordPress - detects new pages)
+    try:
+        if track_sitemap_site4():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error tracking Site4 sitemaps: {e}")
     
     # Track XML sitemaps for Site5 (WordPress - detects new pages)
     try:
