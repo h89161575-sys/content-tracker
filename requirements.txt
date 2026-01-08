@@ -1,0 +1,2 @@
+# No external dependencies required!
+# The tracker uses only Python standard library (urllib, json, re, etc.)

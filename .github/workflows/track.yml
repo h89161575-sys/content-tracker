@@ -1,0 +1,59 @@
+# GitHub Actions workflow for Content Tracker
+# Runs every 5 minutes and commits changes to the repository
+
+name: Track Changes
+
+on:
+  schedule:
+    # Runs every 5 minutes
+    - cron: '*/5 * * * *'
+  
+  # Allows manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+  # Also run on push to main (for testing)
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - '.github/workflows/**'
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    
+    # Grant write permissions to commit snapshot changes
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for proper git operations
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Restore snapshots cache
+        uses: actions/cache@v4
+        with:
+          path: data/snapshots
+          key: snapshots-${{ github.run_id }}
+          restore-keys: |
+            snapshots-
+      
+      - name: Run tracker
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          cd src
+          python tracker.py
