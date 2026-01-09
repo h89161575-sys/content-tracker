@@ -166,3 +166,7 @@ TIMESTAMP_KEYS = [
     "_updatedAt",
     "_createdAt",
 ]
+
+# YouTube Channel ID to track (Dr. Joe Dispenza)
+# RSS Feed URL: https://www.youtube.com/feeds/videos.xml?channel_id=UCSTTPGPS-lm0YVb4DMJ3lTA
+YOUTUBE_CHANNEL_ID = "UCSTTPGPS-lm0YVb4DMJ3lTA"

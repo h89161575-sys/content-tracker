@@ -237,6 +237,91 @@ def send_test_notification(webhook_url: str) -> bool:
     )
 
 
+def send_new_youtube_video_notification(
+    webhook_url: str,
+    videos: List[Dict[str, Any]]
+) -> bool:
+    """
+    Send notification for new YouTube videos.
+    
+    Args:
+        webhook_url: Discord webhook URL
+        videos: List of video dicts with keys: video_id, title, published, thumbnail_url
+    """
+    if not webhook_url or not videos:
+        return False
+    
+    # Build embeds for each video (max 10 per message)
+    embeds = []
+    for video in videos[:10]:
+        video_id = video.get("video_id", "")
+        title = video.get("title", "Neues Video")
+        published = video.get("published", "")[:10] if video.get("published") else ""
+        thumbnail_url = video.get("thumbnail_url", "")
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        embed = {
+            "title": f"🎬 {_truncate(title, 250)}",
+            "url": video_url,
+            "color": 0xFF0000,  # YouTube Red
+            "description": f"Ein neues Video wurde auf dem Dr. Joe Dispenza YouTube-Kanal veröffentlicht!",
+            "fields": [
+                {
+                    "name": "📅 Veröffentlicht",
+                    "value": published if published else "Unbekannt",
+                    "inline": True
+                },
+                {
+                    "name": "🔗 Link",
+                    "value": f"[Video ansehen]({video_url})",
+                    "inline": True
+                }
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "footer": {
+                "text": "YouTube Tracker"
+            }
+        }
+        
+        # Add thumbnail if available
+        if thumbnail_url:
+            embed["thumbnail"] = {"url": thumbnail_url}
+        
+        embeds.append(embed)
+    
+    payload = {"embeds": embeds}
+    
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            },
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            if response.status in (200, 204):
+                print(f"✅ YouTube notification sent: {len(videos)} new video(s)")
+                return True
+            else:
+                print(f"❌ Discord returned status {response.status}")
+                return False
+                
+    except urllib.error.HTTPError as e:
+        print(f"❌ Discord HTTP error: {e.code} - {e.reason}")
+        return False
+    except urllib.error.URLError as e:
+        print(f"❌ Discord URL error: {e.reason}")
+        return False
+    except Exception as e:
+        print(f"❌ Discord error: {e}")
+        return False
+
+
 def _truncate(text: str, max_length: int) -> str:
     """Truncate text to max length with ellipsis."""
     if len(text) <= max_length:

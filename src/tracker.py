@@ -25,6 +25,7 @@ from config import (
     IGNORE_KEYS,
     TIMESTAMP_KEYS,
     PageConfig,
+    YOUTUBE_CHANNEL_ID,
 )
 from notifier import (
     send_new_items_notification,
@@ -32,6 +33,7 @@ from notifier import (
     send_removed_items_notification,
     send_build_change_notification,
     send_test_notification,
+    send_new_youtube_video_notification,
 )
 
 
@@ -1146,6 +1148,97 @@ def track_sitemap_content_site1() -> bool:
     return changes_detected
 
 
+def track_youtube_channel() -> bool:
+    """
+    Track YouTube channel for new video uploads via RSS feed.
+    The RSS feed returns the latest 15 videos - no API key needed.
+    """
+    print("\n📡 Tracking: YouTube-DrJoeDispenza")
+    
+    # YouTube RSS feed URL
+    feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+    
+    # Fetch RSS feed
+    feed_content = fetch_page(feed_url)
+    if not feed_content:
+        print("⚠️  Could not fetch YouTube RSS feed")
+        return False
+    
+    # Parse video entries from XML using regex (keeps dependencies minimal)
+    # Extract: <yt:videoId>, <title>, <published>, <media:thumbnail url="...">
+    video_entries = re.findall(
+        r'<entry>(.*?)</entry>',
+        feed_content,
+        re.DOTALL
+    )
+    
+    videos = []
+    for entry in video_entries:
+        video_id_match = re.search(r'<yt:videoId>([^<]+)</yt:videoId>', entry)
+        title_match = re.search(r'<title>([^<]+)</title>', entry)
+        published_match = re.search(r'<published>([^<]+)</published>', entry)
+        thumbnail_match = re.search(r'<media:thumbnail url="([^"]+)"', entry)
+        
+        if video_id_match:
+            videos.append({
+                "video_id": video_id_match.group(1),
+                "title": unescape(title_match.group(1)) if title_match else "Unbekannt",
+                "published": published_match.group(1) if published_match else "",
+                "thumbnail_url": thumbnail_match.group(1) if thumbnail_match else ""
+            })
+    
+    print(f"📊 Found {len(videos)} videos in RSS feed")
+    
+    if not videos:
+        print("⚠️  No videos found in feed")
+        return False
+    
+    # Load previous snapshot
+    old_snapshot = load_snapshot("youtube_drjoedispenza")
+    
+    # Current video IDs
+    current_video_ids = {v["video_id"] for v in videos}
+    
+    current_data = {
+        "video_ids": sorted(list(current_video_ids)),
+        "videos": videos,  # Store full video data for reference
+        "count": len(videos),
+        "last_checked": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    }
+    
+    if old_snapshot is None:
+        print(f"📝 First YouTube snapshot ({len(videos)} videos)")
+        save_snapshot("youtube_drjoedispenza", current_data)
+        return False
+    
+    old_data = old_snapshot.get("data", {})
+    old_video_ids = set(old_data.get("video_ids", []))
+    
+    # Find new videos
+    new_video_ids = current_video_ids - old_video_ids
+    
+    if not new_video_ids:
+        print("✅ No new YouTube videos")
+        return False
+    
+    # Get full video info for new videos
+    new_videos = [v for v in videos if v["video_id"] in new_video_ids]
+    
+    print(f"🆕 New YouTube videos detected: {len(new_videos)}")
+    for video in new_videos:
+        print(f"   + {video['title'][:50]}...")
+    
+    # Send Discord notification
+    if DISCORD_WEBHOOK_URL:
+        send_new_youtube_video_notification(DISCORD_WEBHOOK_URL, new_videos)
+    else:
+        print("⚠️  No Discord webhook configured - skipping notification")
+    
+    # Save updated snapshot
+    save_snapshot("youtube_drjoedispenza", current_data)
+    
+    return True
+
 def main():
     """Main entry point."""
     # Prevent UnicodeEncodeError on Windows consoles (e.g. cp1252) when printing emojis.
@@ -1235,6 +1328,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking Site1 content: {e}")
+    
+    # Track YouTube channel for new videos
+    try:
+        if track_youtube_channel():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error tracking YouTube channel: {e}")
     
     print("\n" + "=" * 60)
     if changes_detected:
