@@ -49,6 +49,7 @@ Edit `src/config.py` to customize:
 - Pages to track
 - Data paths to extract
 - Keys to ignore during comparison
+- Discord notification limits (e.g. how many changes are shown per message)
 
 ## How It Works
 

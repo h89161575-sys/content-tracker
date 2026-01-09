@@ -1,11 +1,16 @@
 # Main Tracker Script for Website Change Monitoring
 
+import difflib
+import gzip
 import json
 import os
 import re
 import sys
 import hashlib
+import zlib
 from datetime import datetime, timezone
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.request
 import urllib.error
@@ -13,6 +18,7 @@ import urllib.error
 from config import (
     PAGES_TO_TRACK,
     DISCORD_WEBHOOK_URL,
+    DISCORD_MAX_CHANGES,
     SNAPSHOTS_DIR,
     IGNORE_KEYS,
     TIMESTAMP_KEYS,
@@ -33,12 +39,38 @@ def fetch_page(url: str) -> Optional[str]:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
+        # Some sites return gzipped HTML even without explicitly asking; we handle it below.
+        "Accept-Encoding": "gzip, deflate",
     }
     
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
-            return response.read().decode("utf-8")
+            raw = response.read()
+
+            # Handle common HTTP-level compression
+            content_encoding = (response.headers.get("Content-Encoding") or "").lower()
+            if "gzip" in content_encoding or raw[:2] == b"\x1f\x8b":
+                try:
+                    raw = gzip.decompress(raw)
+                except Exception:
+                    pass
+            elif "deflate" in content_encoding:
+                try:
+                    raw = zlib.decompress(raw)
+                except Exception:
+                    try:
+                        raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    except Exception:
+                        pass
+
+            charset = None
+            try:
+                charset = response.headers.get_content_charset()  # type: ignore[attr-defined]
+            except Exception:
+                charset = None
+
+            return raw.decode(charset or "utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         print(f"❌ HTTP error fetching {url}: {e.code}")
         return None
@@ -99,6 +131,167 @@ def normalize_data(data: Any) -> Any:
         return [normalize_data(item) for item in data]
     else:
         return data
+
+
+class _BodyTextExtractor(HTMLParser):
+    """Extract readable text from HTML, inserting newlines on common block boundaries."""
+
+    _BLOCK_TAGS = {
+        "p",
+        "div",
+        "section",
+        "article",
+        "main",
+        "header",
+        "footer",
+        "nav",
+        "aside",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "ul",
+        "ol",
+        "br",
+        "hr",
+        "table",
+        "tr",
+    }
+
+    _SKIP_TAGS = {"script", "style", "noscript", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: List[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if tag in self._BLOCK_TAGS and self._parts and not self._parts[-1].endswith("\n"):
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if tag in self._BLOCK_TAGS and self._parts and not self._parts[-1].endswith("\n"):
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        text = data.strip()
+        if text:
+            self._parts.append(text)
+            self._parts.append(" ")
+
+    def get_text(self) -> str:
+        return "".join(self._parts)
+
+
+def _extract_title_from_html(html: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    title = unescape(match.group(1))
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
+def _extract_clean_body_html(html: str) -> str:
+    """Extract body HTML and remove scripts/styles/noscript blocks to reduce noise."""
+    body_match = re.search(r"<body[^>]*>(.*?)</body>", html, re.DOTALL | re.IGNORECASE)
+    body_content = body_match.group(1) if body_match else html
+
+    body_content = re.sub(r"<script[^>]*>.*?</script>", "", body_content, flags=re.DOTALL | re.IGNORECASE)
+    body_content = re.sub(r"<style[^>]*>.*?</style>", "", body_content, flags=re.DOTALL | re.IGNORECASE)
+
+    return body_content
+
+
+def _extract_text_from_body_html(body_html: str) -> str:
+    extractor = _BodyTextExtractor()
+    try:
+        extractor.feed(body_html)
+        extractor.close()
+    except Exception:
+        # HTML can be malformed; return best-effort text.
+        pass
+
+    raw = unescape(extractor.get_text())
+
+    # Normalize whitespace while keeping some line structure.
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = re.sub(r"\n[ \t]+", "\n", raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+
+    lines = []
+    for line in raw.split("\n"):
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _truncate_for_discord_field_name(text: str, max_length: int = 256) -> str:
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3] + "..."
+
+
+def _summarize_text_diff(old_text: str, new_text: str, *, context_lines: int = 2, max_changed_lines: int = 8) -> str:
+    """
+    Build a small, readable before/after excerpt around the first detected change.
+    Uses line-based diffing to keep output compact for Discord.
+    """
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+
+    if old_lines == new_lines:
+        return ""
+
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines)
+
+    hunks: List[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+
+        # Cap the number of changed lines we show
+        i2_cap = min(i2, i1 + max_changed_lines)
+        j2_cap = min(j2, j1 + max_changed_lines)
+
+        old_start = max(0, i1 - context_lines)
+        old_end = min(len(old_lines), i2_cap + context_lines)
+        new_start = max(0, j1 - context_lines)
+        new_end = min(len(new_lines), j2_cap + context_lines)
+
+        out: List[str] = []
+        out.append("Vorher (Auszug):")
+        for idx in range(old_start, old_end):
+            prefix = "- " if i1 <= idx < i2_cap else "  "
+            out.append(prefix + old_lines[idx])
+
+        out.append("Nachher (Auszug):")
+        for idx in range(new_start, new_end):
+            prefix = "+ " if j1 <= idx < j2_cap else "  "
+            out.append(prefix + new_lines[idx])
+
+        if (i2 - i1) > max_changed_lines or (j2 - j1) > max_changed_lines:
+            out.append("… (gekürzt)")
+
+        hunks.append("\n".join(out))
+        break  # only first hunk; keep Discord output short
+
+    return "\n\n".join(hunks)
 
 
 def get_snapshot_path(page_name: str) -> str:
@@ -706,9 +899,16 @@ def track_sitemap_content_site1() -> bool:
     
     # Load previous content hashes
     old_snapshot = load_snapshot("content_site1")
-    old_hashes = old_snapshot.get("data", {}).get("hashes", {}) if old_snapshot else {}
+    old_data = old_snapshot.get("data", {}) if old_snapshot else {}
+    old_hashes = old_data.get("hashes", {}) or {}
+    old_text_hashes = old_data.get("text_hashes", {}) or {}
+    old_texts = old_data.get("texts", {}) or {}
+    old_titles = old_data.get("titles", {}) or {}
     
     new_hashes = {}
+    new_text_hashes = {}
+    new_texts = {}
+    new_titles = {}
     changes = []
     errors = []
     
@@ -724,21 +924,33 @@ def track_sitemap_content_site1() -> bool:
             errors.append(url)
             continue
         
-        # Extract body content and hash it
-        import re as regex
-        body_match = regex.search(r'<body[^>]*>(.*?)</body>', html, regex.DOTALL | regex.IGNORECASE)
-        body_content = body_match.group(1) if body_match else html
-        
-        # Remove scripts and styles
-        body_content = regex.sub(r'<script[^>]*>.*?</script>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
-        body_content = regex.sub(r'<style[^>]*>.*?</style>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
-        
-        content_hash = hashlib.md5(body_content.encode()).hexdigest()
-        new_hashes[url] = content_hash
-        
+        # Legacy hash: cleaned body HTML (keeps compatibility with existing snapshots)
+        clean_body_html = _extract_clean_body_html(html)
+        html_hash = hashlib.md5(clean_body_html.encode()).hexdigest()
+        new_hashes[url] = html_hash
+
+        # Text extraction for meaningful diffs + future (less noisy) comparisons
+        title = _extract_title_from_html(html) or old_titles.get(url, "")
+        new_titles[url] = title
+
+        extracted_text_full = _extract_text_from_body_html(clean_body_html)
+        text_hash = hashlib.md5(extracted_text_full.encode()).hexdigest()
+        new_text_hashes[url] = text_hash
+        new_texts[url] = extracted_text_full
+
         # Check if content changed
+        # Keep original behaviour (HTML hash) so we don't miss structural/markup changes.
+        # Additionally track text hash so we can produce meaningful diffs.
         old_hash = old_hashes.get(url)
-        if old_hash and old_hash != content_hash:
+        old_text_hash = old_text_hashes.get(url)
+
+        changed = False
+        if old_hash is not None and old_hash != html_hash:
+            changed = True
+        if old_text_hash is not None and old_text_hash != text_hash:
+            changed = True
+
+        if changed:
             changes.append(url)
         
         # Rate limiting: small delay to avoid hammering server
@@ -751,21 +963,50 @@ def track_sitemap_content_site1() -> bool:
     
     if changes:
         print(f"🔄 Content changed on {len(changes)} pages:")
-        for url in changes[:10]:
+        for url in changes[:DISCORD_MAX_CHANGES]:
             print(f"   ~ {url}")
         changes_detected = True
         
         if DISCORD_WEBHOOK_URL:
+            updates: List[Dict[str, Any]] = []
+            for url in changes[:DISCORD_MAX_CHANGES]:
+                title = new_titles.get(url) or old_titles.get(url, "")
+                details_lines: List[str] = []
+                if title:
+                    details_lines.append(f"**{title}**")
+                details_lines.append(f"URL: {url}")
+
+                old_text = old_texts.get(url)
+                new_text = new_texts.get(url, "")
+                if old_text:
+                    diff_summary = _summarize_text_diff(old_text, new_text)
+                    if diff_summary:
+                        details_lines.append(diff_summary)
+                    else:
+                        details_lines.append("Hinweis: Kein Textunterschied erkennbar (evtl. nur HTML/Struktur).")
+                else:
+                    details_lines.append("Hinweis: Text-Baseline wurde neu erstellt; Diff ist ab dem nächsten Lauf verfügbar.")
+
+                updates.append({
+                    "id": url,
+                    "field": "content",
+                    "type": _truncate_for_discord_field_name(f"📝 Content: {title}" if title else "📝 Content geändert"),
+                    "details": "\n".join(details_lines),
+                })
+
             send_updated_items_notification(
                 DISCORD_WEBHOOK_URL,
                 "Site1-Content",
                 "https://drjoedispenza.com",
-                [{"id": url, "field": "content", "old": "changed", "new": "updated"} for url in changes[:10]]
+                updates
             )
     
     # Save new hashes
     current_data = {
         "hashes": new_hashes,
+        "text_hashes": new_text_hashes,
+        "texts": new_texts,
+        "titles": new_titles,
         "count": len(new_hashes),
         "tracked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
@@ -781,6 +1022,16 @@ def track_sitemap_content_site1() -> bool:
 
 def main():
     """Main entry point."""
+    # Prevent UnicodeEncodeError on Windows consoles (e.g. cp1252) when printing emojis.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
     print("=" * 60)
     print(f"🚀 Website Change Tracker")
     print(f"📅 {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}")

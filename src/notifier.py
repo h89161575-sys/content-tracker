@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 import urllib.request
 import urllib.error
 
+from config import DISCORD_MAX_CHANGES
+
 def send_discord_notification(
     webhook_url: str,
     title: str,
@@ -34,7 +36,7 @@ def send_discord_notification(
     
     # Build embed fields from changes
     fields = []
-    for change in changes[:10]:  # Discord limit: 25 fields, we use max 10
+    for change in changes[:DISCORD_MAX_CHANGES]:  # Discord limit: 25 fields
         fields.append({
             "name": change.get("type", "Change"),
             "value": _truncate(change.get("details", "No details"), 1024),
@@ -133,15 +135,24 @@ def send_updated_items_notification(
     """Send notification for updated items."""
     
     changes = []
-    for update in updates[:5]:
+    for update in updates[:DISCORD_MAX_CHANGES]:
         item_id = update.get("id", "Unknown")
         field = update.get("field", "Unknown field")
-        old_val = _truncate(str(update.get("old", "")), 100)
-        new_val = _truncate(str(update.get("new", "")), 100)
+
+        # Allow callers to provide a pre-formatted details string (e.g., a content diff).
+        details_override = update.get("details")
+        if details_override:
+            details = str(details_override)
+        else:
+            old_val = _truncate(str(update.get("old", "")), 100)
+            new_val = _truncate(str(update.get("new", "")), 100)
+            details = f"ID: `{item_id}`\n`{old_val}` → `{new_val}`"
+
+        type_label = update.get("type") or f"📝 Updated: {field}"
         
         changes.append({
-            "type": f"📝 Updated: {field}",
-            "details": f"ID: `{item_id}`\n`{old_val}` → `{new_val}`"
+            "type": str(type_label),
+            "details": details
         })
     
     return send_discord_notification(

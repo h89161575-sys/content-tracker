@@ -30,3 +30,4 @@ Thumbs.db
 # Local testing
 .env
 *.local
+test_webhook.py

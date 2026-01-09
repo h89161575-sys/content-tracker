@@ -114,6 +114,10 @@ PAGES_TO_TRACK = [
 # Discord Webhook URL - set via environment variable
 DISCORD_WEBHOOK_URL: Optional[str] = os.environ.get("DISCORD_WEBHOOK_URL")
 
+# Discord notification display limit (Discord embed limit: max 25 fields per embed)
+# You can override this via environment variable DISCORD_MAX_CHANGES.
+DISCORD_MAX_CHANGES = max(1, min(int(os.environ.get("DISCORD_MAX_CHANGES", "10")), 25))
+
 # Path to store snapshots
 SNAPSHOTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "snapshots")
 
