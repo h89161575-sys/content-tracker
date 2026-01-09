@@ -249,8 +249,10 @@ def _truncate_for_discord_field_name(text: str, max_length: int = 256) -> str:
 
 def _summarize_text_diff(old_text: str, new_text: str, *, context_lines: int = 2, max_changed_lines: int = 8) -> str:
     """
-    Build a small, readable before/after excerpt around the first detected change.
-    Uses line-based diffing to keep output compact for Discord.
+    Build a small, readable diff excerpt around the first detected change.
+
+    Returned text is formatted as a Discord `diff` code block so removals/additions
+    are shown in red/green (depending on client).
     """
     old_lines = old_text.splitlines()
     new_lines = new_text.splitlines()
@@ -258,40 +260,70 @@ def _summarize_text_diff(old_text: str, new_text: str, *, context_lines: int = 2
     if old_lines == new_lines:
         return ""
 
-    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines)
+    # Unified diff is the most Discord-friendly format: lines starting with
+    # '-'/'+' get color-highlighted inside ```diff``` blocks.
+    diff_iter = difflib.unified_diff(
+        old_lines,
+        new_lines,
+        n=context_lines,
+        lineterm="",
+    )
 
-    hunks: List[str] = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
+    lines: List[str] = []
+    hunk_started = False
+    removed = 0
+    added = 0
+    truncated = False
+
+    # Keep this comfortably under Discord's 1024 field limit, because we also
+    # prepend title + URL in the field.
+    max_total_lines = max(12, (context_lines * 2) + (max_changed_lines * 2) + 6)
+    max_line_len = 220
+
+    for line in diff_iter:
+        # Drop file headers, keep only the first hunk body.
+        if line.startswith("---") or line.startswith("+++"):
             continue
 
-        # Cap the number of changed lines we show
-        i2_cap = min(i2, i1 + max_changed_lines)
-        j2_cap = min(j2, j1 + max_changed_lines)
+        if line.startswith("@@"):
+            if hunk_started:
+                break  # only first hunk
+            hunk_started = True
+            continue  # skip hunk header (line numbers are noise here)
 
-        old_start = max(0, i1 - context_lines)
-        old_end = min(len(old_lines), i2_cap + context_lines)
-        new_start = max(0, j1 - context_lines)
-        new_end = min(len(new_lines), j2_cap + context_lines)
+        if not hunk_started:
+            continue
 
-        out: List[str] = []
-        out.append("Vorher (Auszug):")
-        for idx in range(old_start, old_end):
-            prefix = "- " if i1 <= idx < i2_cap else "  "
-            out.append(prefix + old_lines[idx])
+        # Cap the number of +/- lines for readability
+        if line.startswith("-"):
+            if removed >= max_changed_lines:
+                truncated = True
+                continue
+            removed += 1
+        elif line.startswith("+"):
+            if added >= max_changed_lines:
+                truncated = True
+                continue
+            added += 1
 
-        out.append("Nachher (Auszug):")
-        for idx in range(new_start, new_end):
-            prefix = "+ " if j1 <= idx < j2_cap else "  "
-            out.append(prefix + new_lines[idx])
+        # Prevent overly long single lines from blowing up the embed field.
+        if len(line) > max_line_len:
+            line = line[: max_line_len - 3] + "..."
+            truncated = True
 
-        if (i2 - i1) > max_changed_lines or (j2 - j1) > max_changed_lines:
-            out.append("… (gekürzt)")
+        lines.append(line)
+        if len(lines) >= max_total_lines:
+            truncated = True
+            break
 
-        hunks.append("\n".join(out))
-        break  # only first hunk; keep Discord output short
+    if not lines:
+        return ""
 
-    return "\n\n".join(hunks)
+    if truncated:
+        # Start with a space so it won't be colored as +/- in diff blocks.
+        lines.append("  ... (gekürzt)")
+
+    return "```diff\n" + "\n".join(lines) + "\n```"
 
 
 def get_snapshot_path(page_name: str) -> str:
@@ -981,6 +1013,7 @@ def track_sitemap_content_site1() -> bool:
                 if old_text:
                     diff_summary = _summarize_text_diff(old_text, new_text)
                     if diff_summary:
+                        details_lines.append("Diff (rot = entfernt, grün = neu):")
                         details_lines.append(diff_summary)
                     else:
                         details_lines.append("Hinweis: Kein Textunterschied erkennbar (evtl. nur HTML/Struktur).")
