@@ -1011,7 +1011,9 @@ def track_sitemap_content_site1() -> bool:
                 old_text = old_texts.get(url)
                 new_text = new_texts.get(url, "")
                 if old_text:
-                    diff_summary = _summarize_text_diff(old_text, new_text)
+                    # Feinschliff: keep Discord output compact by showing only changed lines (+/-),
+                    # without unchanged context lines.
+                    diff_summary = _summarize_text_diff(old_text, new_text, context_lines=0)
                     if diff_summary:
                         details_lines.append("Diff (rot = entfernt, grün = neu):")
                         details_lines.append(diff_summary)
