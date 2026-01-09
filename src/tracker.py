@@ -598,6 +598,187 @@ def track_sitemap_site4() -> bool:
     return False
 
 
+def track_sitemap_site1() -> bool:
+    """Track XML sitemap for Site1 (drjoedispenza.com) to detect new pages."""
+    print("\n📡 Tracking: Site1 XML Sitemap")
+    
+    sitemap_url = "https://drjoedispenza.com/sitemap.xml"
+    content = fetch_page(sitemap_url)
+    
+    if not content:
+        print("⚠️  Could not fetch Site1 sitemap")
+        return False
+    
+    # Extract all URLs from sitemap
+    import re as regex
+    all_urls = set(regex.findall(r'<loc>(https?://[^<]+)</loc>', content))
+    
+    print(f"📊 Found {len(all_urls)} total URLs in Site1 sitemap")
+    
+    # Load previous snapshot
+    old_snapshot = load_snapshot("sitemap_site1")
+    
+    current_data = {
+        "urls": sorted(list(all_urls)),
+        "count": len(all_urls),
+        "hash": hashlib.md5(str(sorted(all_urls)).encode()).hexdigest()
+    }
+    
+    if old_snapshot is None:
+        print(f"📝 First Site1 sitemap snapshot ({len(all_urls)} URLs)")
+        save_snapshot("sitemap_site1", current_data)
+        return False
+    
+    old_data = old_snapshot.get("data", {})
+    old_urls = set(old_data.get("urls", []))
+    
+    # Check for new/removed URLs
+    new_urls = all_urls - old_urls
+    removed_urls = old_urls - all_urls
+    
+    changes_detected = False
+    
+    if new_urls:
+        print(f"🆕 New Site1 pages detected: {len(new_urls)}")
+        for url in list(new_urls)[:5]:
+            print(f"   + {url}")
+        changes_detected = True
+        
+        if DISCORD_WEBHOOK_URL:
+            send_build_change_notification(
+                DISCORD_WEBHOOK_URL,
+                f"Site1: {len(old_urls)} pages",
+                f"Site1: {len(all_urls)} pages (+{len(new_urls)} new)",
+                sorted(list(new_urls))[:10]
+            )
+    
+    if removed_urls:
+        print(f"🗑️ Removed Site1 pages: {len(removed_urls)}")
+        for url in list(removed_urls)[:5]:
+            print(f"   - {url}")
+        changes_detected = True
+        
+        if DISCORD_WEBHOOK_URL:
+            send_removed_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Sitemap",
+                "https://drjoedispenza.com/sitemap.xml",
+                [{"url": u} for u in sorted(list(removed_urls))[:10]]
+            )
+    
+    if changes_detected:
+        save_snapshot("sitemap_site1", current_data)
+        return True
+    
+    print("✅ No Site1 sitemap changes")
+    return False
+
+
+def track_sitemap_content_site1() -> bool:
+    """
+    Track CONTENT CHANGES on Site1 pages from sitemap.
+    Excludes blog posts and stories of transformation to reduce load.
+    """
+    print("\n📡 Tracking: Site1 Page Content (filtered)")
+    
+    # Load sitemap snapshot to get URLs
+    sitemap_snapshot = load_snapshot("sitemap_site1")
+    if not sitemap_snapshot:
+        print("⚠️  No sitemap snapshot found - run sitemap tracking first")
+        return False
+    
+    all_urls = sitemap_snapshot.get("data", {}).get("urls", [])
+    
+    # Filter out blogs, stories, and individual product pages (too many)
+    # Shop page already tracks all products
+    EXCLUDE_PATTERNS = [
+        "/dr-joes-blog/",
+        "/stories-of-transformation/",
+        "/product-details/",
+    ]
+    
+    filtered_urls = [
+        url for url in all_urls 
+        if not any(pattern in url for pattern in EXCLUDE_PATTERNS)
+    ]
+    
+    print(f"📊 Tracking content on {len(filtered_urls)} pages (excluded {len(all_urls) - len(filtered_urls)} blog/story posts)")
+    
+    # Load previous content hashes
+    old_snapshot = load_snapshot("content_site1")
+    old_hashes = old_snapshot.get("data", {}).get("hashes", {}) if old_snapshot else {}
+    
+    new_hashes = {}
+    changes = []
+    errors = []
+    
+    import time
+    
+    for i, url in enumerate(filtered_urls):
+        # Progress indicator every 50 pages
+        if i > 0 and i % 50 == 0:
+            print(f"   Progress: {i}/{len(filtered_urls)} pages...")
+        
+        html = fetch_page(url)
+        if not html:
+            errors.append(url)
+            continue
+        
+        # Extract body content and hash it
+        import re as regex
+        body_match = regex.search(r'<body[^>]*>(.*?)</body>', html, regex.DOTALL | regex.IGNORECASE)
+        body_content = body_match.group(1) if body_match else html
+        
+        # Remove scripts and styles
+        body_content = regex.sub(r'<script[^>]*>.*?</script>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
+        body_content = regex.sub(r'<style[^>]*>.*?</style>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
+        
+        content_hash = hashlib.md5(body_content.encode()).hexdigest()
+        new_hashes[url] = content_hash
+        
+        # Check if content changed
+        old_hash = old_hashes.get(url)
+        if old_hash and old_hash != content_hash:
+            changes.append(url)
+        
+        # Rate limiting: small delay to avoid hammering server
+        time.sleep(0.1)
+    
+    print(f"   ✅ Fetched {len(new_hashes)} pages, {len(errors)} errors")
+    
+    # Report changes
+    changes_detected = False
+    
+    if changes:
+        print(f"🔄 Content changed on {len(changes)} pages:")
+        for url in changes[:10]:
+            print(f"   ~ {url}")
+        changes_detected = True
+        
+        if DISCORD_WEBHOOK_URL:
+            send_updated_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Content",
+                "https://drjoedispenza.com",
+                [{"id": url, "field": "content", "old": "changed", "new": "updated"} for url in changes[:10]]
+            )
+    
+    # Save new hashes
+    current_data = {
+        "hashes": new_hashes,
+        "count": len(new_hashes),
+        "tracked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    }
+    save_snapshot("content_site1", current_data)
+    
+    if not changes and old_snapshot:
+        print("✅ No content changes detected")
+    elif not old_snapshot:
+        print(f"📝 First content snapshot ({len(new_hashes)} pages)")
+    
+    return changes_detected
+
+
 def main():
     """Main entry point."""
     print("=" * 60)
@@ -663,6 +844,20 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking Site5 sitemaps: {e}")
+    
+    # Track XML sitemap for Site1 (drjoedispenza.com - detects new/removed pages)
+    try:
+        if track_sitemap_site1():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error tracking Site1 sitemap: {e}")
+    
+    # Track CONTENT changes on Site1 pages (excludes blogs, stories, product-details)
+    try:
+        if track_sitemap_content_site1():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error tracking Site1 content: {e}")
     
     print("\n" + "=" * 60)
     if changes_detected:

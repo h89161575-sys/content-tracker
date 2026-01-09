@@ -29,6 +29,11 @@ PAGES_TO_TRACK = [
         data_path="props.pageProps"
     ),
     PageConfig(
+        name="Site1-Shop-German",
+        url="https://drjoedispenza.com/shop/categories?shopSection=All%20Products&f=Deutsch",
+        data_path="props.pageProps"
+    ),
+    PageConfig(
         name="Site1-Blog",
         url="https://drjoedispenza.com/dr-joes-blog",
         data_path="props.pageProps"
@@ -65,6 +70,28 @@ PAGES_TO_TRACK = [
         url="https://drjoedispenza.info/s/Drjoedispenza/blog",
         data_path="props.pageProps"
     ),
+    # Site 2 - Product Categories (track content changes for each category)
+    PageConfig(name="Site2-Books", url="https://drjoedispenza.info/s/Drjoedispenza/produkte?block_2912279_group_id=16407", data_path="props.pageProps"),
+    PageConfig(name="Site2-Meditations", url="https://drjoedispenza.info/s/Drjoedispenza/produkte?block_2912279_group_id=4346", data_path="props.pageProps"),
+    PageConfig(name="Site2-Audiobooks", url="https://drjoedispenza.info/s/Drjoedispenza/produkte?block_2912279_group_id=4348", data_path="props.pageProps"),
+    PageConfig(name="Site2-CDs", url="https://drjoedispenza.info/s/Drjoedispenza/produkte?block_2912279_group_id=16408", data_path="props.pageProps"),
+    PageConfig(name="Site2-Music", url="https://drjoedispenza.info/s/Drjoedispenza/produkte?block_2912279_group_id=4347", data_path="props.pageProps"),
+    PageConfig(name="Site2-Free", url="https://drjoedispenza.info/s/Drjoedispenza/produkte?block_2912279_group_id=4350", data_path="props.pageProps"),
+    PageConfig(name="Site2-Mask", url="https://drjoedispenza.info/s/Drjoedispenza/produkte?block_2912279_group_id=16188", data_path="props.pageProps"),
+    PageConfig(name="Site2-Contact", url="https://drjoedispenza.info/s/Drjoedispenza/kontakt_seite", data_path="props.pageProps"),
+    
+    # === Site 3 (German Marketing Site - drjoedispenza.de) ===
+    PageConfig(name="Site3-Home", url="https://www.drjoedispenza.de", data_path="props.pageProps"),
+    PageConfig(name="Site3-Mission", url="https://www.drjoedispenza.de/mission", data_path="props.pageProps"),
+    PageConfig(name="Site3-Source", url="https://www.drjoedispenza.de/source-filmbundle", data_path="props.pageProps"),
+    PageConfig(name="Site3-Formula", url="https://www.drjoedispenza.de/the-formula-2025", data_path="props.pageProps"),
+    PageConfig(name="Site3-Redesigning", url="https://www.drjoedispenza.de/redesigning-your-destiny", data_path="props.pageProps"),
+    PageConfig(name="Site3-Supernatural", url="https://www.drjoedispenza.de/supernatural-change", data_path="props.pageProps"),
+    PageConfig(name="Site3-DrJoeLive", url="https://www.drjoedispenza.de/dr-joe-live", data_path="props.pageProps"),
+    PageConfig(name="Site3-Blogs", url="https://www.drjoedispenza.de/ubersicht-blogbeitrage-2025", data_path="props.pageProps"),
+    PageConfig(name="Site3-Testimonials", url="https://www.drjoedispenza.de/testimonials", data_path="props.pageProps"),
+    PageConfig(name="Site3-Videos", url="https://www.drjoedispenza.de/videos", data_path="props.pageProps"),
+    PageConfig(name="Site3-Copenhagen", url="https://www.drjoedispenza.de/kopenhagen-warteliste-2026", data_path="props.pageProps"),
     
     # === Site 4 ===
     PageConfig(name="Site4-Home", url="https://metamorphllc.net/", data_path="props.pageProps"),
