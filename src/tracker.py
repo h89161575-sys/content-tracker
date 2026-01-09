@@ -19,6 +19,8 @@ from config import (
     PAGES_TO_TRACK,
     DISCORD_WEBHOOK_URL,
     DISCORD_MAX_CHANGES,
+    SITE1_CONTENT_EXCLUDE_SECTION_HEADINGS,
+    SITE1_CONTENT_EXCLUDE_HTML_CLASS_SUBSTRINGS,
     SNAPSHOTS_DIR,
     IGNORE_KEYS,
     TIMESTAMP_KEYS,
@@ -161,18 +163,63 @@ class _BodyTextExtractor(HTMLParser):
         "tr",
     }
 
+    _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
     _SKIP_TAGS = {"script", "style", "noscript", "svg"}
 
-    def __init__(self) -> None:
+    @staticmethod
+    def _normalize_heading(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "")).strip().casefold()
+
+    def __init__(
+        self,
+        exclude_section_headings: Optional[List[str]] = None,
+        exclude_container_class_substrings: Optional[List[str]] = None,
+    ) -> None:
         super().__init__()
         self._parts: List[str] = []
         self._skip_depth = 0
+        self._skip_container_depth = 0
+        self._heading_tag: Optional[str] = None
+        self._heading_text_parts: List[str] = []
+        self._excluded_heading_norms = {
+            self._normalize_heading(h) for h in (exclude_section_headings or []) if h and h.strip()
+        }
+        self._exclude_class_substrings = [
+            s.strip().lower()
+            for s in (exclude_container_class_substrings or [])
+            if s and s.strip()
+        ]
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
         if tag in self._SKIP_TAGS:
             self._skip_depth += 1
             return
+
+        # Skip entire containers based on class name markers (used to exclude noisy widgets).
+        if self._skip_container_depth:
+            self._skip_container_depth += 1
+            return
+
+        if self._exclude_class_substrings:
+            class_attr = None
+            for name, value in attrs:
+                if name and name.lower() == "class" and value:
+                    class_attr = value.lower()
+                    break
+            if class_attr and any(sub in class_attr for sub in self._exclude_class_substrings):
+                self._skip_container_depth = 1
+                return
+
+        # Ignore markup inside headings; we only keep the heading text.
+        if tag in self._HEADING_TAGS:
+            self._heading_tag = tag
+            self._heading_text_parts = []
+            return
+
+        if self._heading_tag:
+            return
+
         if tag in self._BLOCK_TAGS and self._parts and not self._parts[-1].endswith("\n"):
             self._parts.append("\n")
 
@@ -181,14 +228,38 @@ class _BodyTextExtractor(HTMLParser):
         if tag in self._SKIP_TAGS and self._skip_depth:
             self._skip_depth -= 1
             return
+
+        if self._skip_container_depth:
+            self._skip_container_depth -= 1
+            return
+
+        if self._heading_tag:
+            # End of current heading: keep or drop the heading line.
+            if tag == self._heading_tag:
+                heading_text = " ".join(self._heading_text_parts).strip()
+                if heading_text and self._normalize_heading(heading_text) not in self._excluded_heading_norms:
+                    if self._parts and not self._parts[-1].endswith("\n"):
+                        self._parts.append("\n")
+                    self._parts.append(heading_text)
+                    self._parts.append("\n")
+
+                self._heading_tag = None
+                self._heading_text_parts = []
+            return
+
         if tag in self._BLOCK_TAGS and self._parts and not self._parts[-1].endswith("\n"):
             self._parts.append("\n")
 
     def handle_data(self, data: str) -> None:
         if self._skip_depth:
             return
+        if self._skip_container_depth:
+            return
         text = data.strip()
         if text:
+            if self._heading_tag:
+                self._heading_text_parts.append(text)
+                return
             self._parts.append(text)
             self._parts.append(" ")
 
@@ -216,8 +287,16 @@ def _extract_clean_body_html(html: str) -> str:
     return body_content
 
 
-def _extract_text_from_body_html(body_html: str) -> str:
-    extractor = _BodyTextExtractor()
+def _extract_text_from_body_html(
+    body_html: str,
+    *,
+    exclude_section_headings: Optional[List[str]] = None,
+    exclude_container_class_substrings: Optional[List[str]] = None,
+) -> str:
+    extractor = _BodyTextExtractor(
+        exclude_section_headings=exclude_section_headings,
+        exclude_container_class_substrings=exclude_container_class_substrings,
+    )
     try:
         extractor.feed(body_html)
         extractor.close()
@@ -936,6 +1015,22 @@ def track_sitemap_content_site1() -> bool:
     old_text_hashes = old_data.get("text_hashes", {}) or {}
     old_texts = old_data.get("texts", {}) or {}
     old_titles = old_data.get("titles", {}) or {}
+    old_excluded_headings = old_data.get("exclude_section_headings")
+    old_excluded_classes = old_data.get("exclude_html_class_substrings")
+
+    current_excluded_headings = SITE1_CONTENT_EXCLUDE_SECTION_HEADINGS
+    current_excluded_classes = SITE1_CONTENT_EXCLUDE_HTML_CLASS_SUBSTRINGS
+    baseline_reset = (
+        old_snapshot is not None
+        and (
+            old_excluded_headings != current_excluded_headings
+            or old_excluded_classes != current_excluded_classes
+        )
+    )
+    if baseline_reset:
+        print(
+            "ℹ️  Site1-Content filter settings changed - updating baseline and skipping notifications for this run"
+        )
     
     new_hashes = {}
     new_text_hashes = {}
@@ -965,24 +1060,18 @@ def track_sitemap_content_site1() -> bool:
         title = _extract_title_from_html(html) or old_titles.get(url, "")
         new_titles[url] = title
 
-        extracted_text_full = _extract_text_from_body_html(clean_body_html)
+        extracted_text_full = _extract_text_from_body_html(
+            clean_body_html,
+            exclude_section_headings=current_excluded_headings,
+            exclude_container_class_substrings=current_excluded_classes,
+        )
         text_hash = hashlib.md5(extracted_text_full.encode()).hexdigest()
         new_text_hashes[url] = text_hash
         new_texts[url] = extracted_text_full
 
         # Check if content changed
-        # Keep original behaviour (HTML hash) so we don't miss structural/markup changes.
-        # Additionally track text hash so we can produce meaningful diffs.
-        old_hash = old_hashes.get(url)
         old_text_hash = old_text_hashes.get(url)
-
-        changed = False
-        if old_hash is not None and old_hash != html_hash:
-            changed = True
-        if old_text_hash is not None and old_text_hash != text_hash:
-            changed = True
-
-        if changed:
+        if not baseline_reset and old_text_hash is not None and old_text_hash != text_hash:
             changes.append(url)
         
         # Rate limiting: small delay to avoid hammering server
@@ -993,7 +1082,7 @@ def track_sitemap_content_site1() -> bool:
     # Report changes
     changes_detected = False
     
-    if changes:
+    if changes and not baseline_reset:
         print(f"🔄 Content changed on {len(changes)} pages:")
         for url in changes[:DISCORD_MAX_CHANGES]:
             print(f"   ~ {url}")
@@ -1042,6 +1131,8 @@ def track_sitemap_content_site1() -> bool:
         "text_hashes": new_text_hashes,
         "texts": new_texts,
         "titles": new_titles,
+        "exclude_section_headings": current_excluded_headings,
+        "exclude_html_class_substrings": current_excluded_classes,
         "count": len(new_hashes),
         "tracked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }

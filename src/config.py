@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 @dataclass
 class PageConfig:
@@ -117,6 +117,27 @@ DISCORD_WEBHOOK_URL: Optional[str] = os.environ.get("DISCORD_WEBHOOK_URL")
 # Discord notification display limit (Discord embed limit: max 25 fields per embed)
 # You can override this via environment variable DISCORD_MAX_CHANGES.
 DISCORD_MAX_CHANGES = max(1, min(int(os.environ.get("DISCORD_MAX_CHANGES", "20")), 25))
+
+# Site1 content tracker: section headings to exclude from hashing/diffing to reduce noise.
+# Override via env var SITE1_CONTENT_EXCLUDE_SECTION_HEADINGS (comma-separated list).
+_SITE1_CONTENT_EXCLUDE_RAW = os.environ.get(
+    "SITE1_CONTENT_EXCLUDE_SECTION_HEADINGS",
+    "Recommended Scientific Research",
+)
+SITE1_CONTENT_EXCLUDE_SECTION_HEADINGS: List[str] = [
+    h.strip() for h in _SITE1_CONTENT_EXCLUDE_RAW.split(",") if h.strip()
+]
+
+# Site1 content tracker: HTML class substrings to exclude entirely (useful to ignore
+# dynamic recommendation widgets that cause noisy updates).
+# Override via env var SITE1_CONTENT_EXCLUDE_HTML_CLASS_SUBSTRINGS (comma-separated list).
+_SITE1_CONTENT_EXCLUDE_CLASS_RAW = os.environ.get(
+    "SITE1_CONTENT_EXCLUDE_HTML_CLASS_SUBSTRINGS",
+    "recommendedBlogs",
+)
+SITE1_CONTENT_EXCLUDE_HTML_CLASS_SUBSTRINGS: List[str] = [
+    c.strip() for c in _SITE1_CONTENT_EXCLUDE_CLASS_RAW.split(",") if c.strip()
+]
 
 # Path to store snapshots
 SNAPSHOTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "snapshots")

@@ -50,6 +50,7 @@ Edit `src/config.py` to customize:
 - Data paths to extract
 - Keys to ignore during comparison
 - Discord notification limits (e.g. how many changes are shown per message)
+- Site1-Content noise filters (e.g. exclude recommendation widgets from hashing/diffs)
 
 ## How It Works
 
