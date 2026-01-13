@@ -111,6 +111,31 @@ PAGES_TO_TRACK = [
     PageConfig(name="Site5-CatalystBusiness", url="https://innerscienceresearch.org/global-catalyst-business/", data_path="props.pageProps"),
 ]
 
+# === Dynamically load additional Site3 URLs ===
+_SITE3_URLS_FILE = os.path.join(os.path.dirname(__file__), "site3_all_urls.txt")
+if os.path.exists(_SITE3_URLS_FILE):
+    try:
+        with open(_SITE3_URLS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and line.startswith("http"):
+                    # Generate a name from the URL slug
+                    slug = line.rstrip("/").split("/")[-1]
+                    if not slug: 
+                        slug = "Home"
+                    # Avoid duplicates if already manually defined
+                    if not any(p.url == line for p in PAGES_TO_TRACK):
+                        PAGES_TO_TRACK.append(
+                            PageConfig(
+                                name=f"Site3-{slug}",
+                                url=line,
+                                data_path="props.pageProps" # Will fallback to HTML tracking anyway
+                            )
+                        )
+        print(f"✅ Loaded additional Site3 URLs from {_SITE3_URLS_FILE}")
+    except Exception as e:
+        print(f"⚠️ Error loading site3_all_urls.txt: {e}")
+
 # Discord Webhook URL - set via environment variable
 DISCORD_WEBHOOK_URL: Optional[str] = os.environ.get("DISCORD_WEBHOOK_URL")
 

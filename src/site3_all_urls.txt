@@ -1,0 +1,71 @@
+# Site3 (drjoedispenza.de) - Manually Curated URL List
+# Contains discovered hidden pages and course pages
+# Last updated: 2026-01-13
+
+## MAIN_PAGES
+https://www.drjoedispenza.de/
+https://www.drjoedispenza.de/mission
+https://www.drjoedispenza.de/dr-joe-live
+https://www.drjoedispenza.de/angebotsubersicht
+https://www.drjoedispenza.de/videos
+https://www.drjoedispenza.de/testimonials
+https://www.drjoedispenza.de/agb
+https://www.drjoedispenza.de/datenschutz
+https://www.drjoedispenza.de/impressum
+
+## BLOG_ARCHIVES
+https://www.drjoedispenza.de/ubersicht-blogbeitrage-2026
+https://www.drjoedispenza.de/ubersicht-blogbeitrage-2025
+https://www.drjoedispenza.de/ubersicht-blogbeitrage-2024
+https://www.drjoedispenza.de/ubersicht-blogbeitrage-2023
+https://www.drjoedispenza.de/ubersicht-blogbeitrage-2022
+https://www.drjoedispenza.de/ubersicht-blogbeitrage-2021
+https://www.drjoedispenza.de/ubersicht-blogbeitrage-2020
+
+## COURSES_PUBLIC
+https://www.drjoedispenza.de/source-filmbundle
+https://www.drjoedispenza.de/the-formula-2025
+https://www.drjoedispenza.de/redesigning-your-destiny
+https://www.drjoedispenza.de/supernatural-change
+
+## GENERATING_SERIES
+https://www.drjoedispenza.de/generating-series-herzlich-willkommen-2026
+https://www.drjoedispenza.de/warum-du-nicht-nachsehen-solltest
+https://www.drjoedispenza.de/einfuhrung
+https://www.drjoedispenza.de/meditationshinweise-generating
+https://www.drjoedispenza.de/tag-1-erzeuge-veranderung
+https://www.drjoedispenza.de/tag-2-erzeuge-inspiration
+https://www.drjoedispenza.de/tag-3-erzeuge-flow
+https://www.drjoedispenza.de/tag-4erzeuge-kraft-und-starke
+https://www.drjoedispenza.de/tag-5-erzeuge-dankbarkeit
+https://www.drjoedispenza.de/tag-6-erzeuge-freude
+https://www.drjoedispenza.de/warum-jede-meditation-ein-gewinn-ist
+https://www.drjoedispenza.de/wie-du-immer-energie-hast
+https://www.drjoedispenza.de/deine-emotionen
+https://www.drjoedispenza.de/liebe-und-dankbarkeit
+https://www.drjoedispenza.de/flow-in-deinem-leben
+https://www.drjoedispenza.de/durch-selbstliebe-und-meditation-leben-verandern
+https://www.drjoedispenza.de/erfahrungsbericht-1
+
+## INSPIRE_V1_COURSE
+https://www.drjoedispenza.de/tag-2
+https://www.drjoedispenza.de/tag-1
+https://www.drjoedispenza.de/tag-3
+https://www.drjoedispenza.de/tag4
+https://www.drjoedispenza.de/tag-5
+https://www.drjoedispenza.de/tag1-bonus
+https://www.drjoedispenza.de/tag-2-bonus
+https://www.drjoedispenza.de/tag-3-bonus
+https://www.drjoedispenza.de/tag-4-bonus
+https://www.drjoedispenza.de/inspire-willkommen
+https://www.drjoedispenza.de/inspire-atemtechnik
+https://www.drjoedispenza.de/inspire-volume-1-sp
+https://www.drjoedispenza.de/blogartikel
+https://www.drjoedispenza.de/befreit-von-zweifeln-und-schmerz
+https://www.drjoedispenza.de/geheilt-durch-die-kraftder-atmung
+
+## SEGNUNG_DER_ENERGIEZENTREN
+https://www.drjoedispenza.de/segnung-der-energiezentren-v
+
+## SOURCE_2025
+https://www.drjoedispenza.de/source-willkommen-2025
