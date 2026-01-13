@@ -31,3 +31,6 @@ Thumbs.db
 .env
 *.local
 test_webhook.py
+
+# Crawler output (only src/site3_all_urls.txt is needed)
+site3_all_urls.txt
