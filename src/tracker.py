@@ -101,6 +101,113 @@ def extract_next_data(html: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def extract_site6_bootstrap_data(html: str) -> Optional[Dict[str, Any]]:
+    """Extract data from Site6's bootstrap object.
+    
+    Site6 uses JavaScript object literals (with single quotes, unquoted keys, etc.)
+    which is not valid JSON. This function handles the conversion.
+    """
+    # Pattern to find 'const bootstrap = {...}' or 'var bootstrap = {...}'
+    # Use a greedy match to get the full object, then find the matching closing brace
+    match = re.search(r'(?:const|var|let)\s+bootstrap\s*=\s*\{', html)
+    if not match:
+        return None
+    
+    start_idx = match.end() - 1  # Position of opening brace
+    
+    # Find matching closing brace by counting braces
+    brace_count = 0
+    end_idx = start_idx
+    in_string = False
+    string_char = None
+    
+    for i, char in enumerate(html[start_idx:], start_idx):
+        if in_string:
+            if char == string_char and html[i-1] != '\\':
+                in_string = False
+        else:
+            if char in ('"', "'"):
+                in_string = True
+                string_char = char
+            elif char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    end_idx = i + 1
+                    break
+    
+    if end_idx <= start_idx:
+        return None
+    
+    js_obj = html[start_idx:end_idx]
+    
+    # Convert JavaScript object literal to valid JSON:
+    # 1. Replace single-quoted strings with double-quoted
+    # 2. Quote unquoted keys
+    # 3. Handle trailing commas
+    
+    try:
+        # Strategy: Use regex to fix common JS-to-JSON issues
+        json_str = js_obj
+        
+        # Replace single quotes around keys and string values with double quotes
+        # This is a simplified approach - handles most common cases
+        json_str = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", r'"\1"', json_str)
+        
+        # Quote unquoted keys: { key: value } -> { "key": value }
+        json_str = re.sub(r'(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', json_str)
+        
+        # Remove trailing commas before } or ]
+        json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
+        
+        # Handle boolean values (true/false are the same in JS and JSON)
+        # Handle undefined -> null
+        json_str = re.sub(r'\bundefined\b', 'null', json_str)
+        
+        data = json.loads(json_str)
+        
+        # Parse 'project_data' string if it exists
+        if 'project_data' in data and isinstance(data['project_data'], str):
+            try:
+                data['project_data'] = json.loads(data['project_data'])
+            except json.JSONDecodeError:
+                pass  # Keep as string if parsing fails
+        
+        return data
+        
+    except json.JSONDecodeError as e:
+        # Fallback: extract key fields manually using regex
+        result = {}
+        
+        # Extract projectDate (for change detection)
+        date_match = re.search(r"'projectDate'\s*:\s*\"([^\"]+)\"", js_obj)
+        if date_match:
+            result['projectDate'] = date_match.group(1)
+        
+        # Extract projectName
+        name_match = re.search(r"'projectName'\s*:\s*\"([^\"]+)\"", js_obj)
+        if name_match:
+            result['projectName'] = name_match.group(1)
+        
+        # Extract project_data as raw string for hashing
+        pd_match = re.search(r"'project_data'\s*:\s*\"((?:[^\"\\]|\\.)*)\"", js_obj, re.DOTALL)
+        if pd_match:
+            result['project_data'] = pd_match.group(1)
+        
+        # Extract pid
+        pid_match = re.search(r"'pid'\s*:\s*\"([^\"]+)\"", js_obj)
+        if pid_match:
+            result['pid'] = pid_match.group(1)
+        
+        if result:
+            return result
+        
+        return None
+
+
+
+
 def get_nested_value(data: Dict[str, Any], path: str) -> Any:
     """Get a nested value from a dict using dot notation."""
     keys = path.split(".")
@@ -527,6 +634,13 @@ def track_page(page: PageConfig) -> bool:
     
     # Try to extract Next.js data, fall back to HTML content if not available
     next_data = extract_next_data(html)
+    
+    # Check for Site6 bootstrap data fallback
+    if not next_data and "visme.co" in page.url:
+         site6_data = extract_site6_bootstrap_data(html)
+         if site6_data:
+             next_data = site6_data
+             print(f"✅ Extracted Site6 data for {page.name}")
     if next_data:
         # Get the specific data we care about
         page_data = get_nested_value(next_data, page.data_path)

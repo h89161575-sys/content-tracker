@@ -109,6 +109,13 @@ PAGES_TO_TRACK = [
     PageConfig(name="Site5-Invitations", url="https://innerscienceresearch.org/invitations/", data_path="props.pageProps"),
     PageConfig(name="Site5-Live", url="https://innerscienceresearch.org/live/", data_path="props.pageProps"),
     PageConfig(name="Site5-CatalystBusiness", url="https://innerscienceresearch.org/global-catalyst-business/", data_path="props.pageProps"),
+    
+    # === Site 6 ===
+    PageConfig(
+        name="Site6-Page1",
+        url="https://my.visme.co/view/76r8rk7z-pmx2v48gp96d2qvz#s1",
+        data_path="project_data" 
+    ),
 ]
 
 # === Dynamically load additional Site3 URLs ===
@@ -180,6 +187,11 @@ IGNORE_KEYS = [
     "defaultLocale",
     "isPreview",
     "notFoundSrcPage",
+    # Site6 specific
+    "viewerId",
+    "sessionId",
+    "sessionToken",
+    "requestId",
 ]
 
 # Keys that contain timestamps or session data (normalize these)
