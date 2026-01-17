@@ -1353,6 +1353,209 @@ def track_youtube_channel() -> bool:
     
     return True
 
+
+def track_site7_helpcenter() -> bool:
+    """
+    Track Site7 help center for changes.
+    
+    This function:
+    1. Crawls the entire help center to discover all pages (collections and articles)
+    2. Detects new and removed pages
+    3. Tracks content changes on each individual page
+    """
+    import time
+    
+    print("\n📡 Tracking: Site7 Help Center")
+    
+    BASE_URL = "https://hilfe.drjoedispenza.de"
+    START_URL = f"{BASE_URL}/de/"
+    
+    def extract_site7_links(html: str, base_url: str) -> set:
+        """Extract all internal help center links from HTML."""
+        links = set()
+        # Match relative and absolute href links
+        patterns = [
+            r'href="(/de/[^"#]+)"',
+            r'href="(' + re.escape(BASE_URL) + r'/de/[^"#]+)"',
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, html)
+            for match in matches:
+                if match.startswith("/"):
+                    full_url = base_url + match
+                else:
+                    full_url = match
+                # Normalize URL (remove trailing slash for consistency)
+                full_url = full_url.rstrip("/")
+                # Only include actual content pages (collections and articles)
+                if "/de/collections/" in full_url or "/de/articles/" in full_url:
+                    links.add(full_url)
+                elif full_url == f"{base_url}/de":
+                    links.add(full_url)
+        return links
+    
+    def crawl_site7() -> dict:
+        """Crawl the entire Site7 help center and return all discovered URLs with their content hashes."""
+        discovered = {}
+        to_visit = {START_URL.rstrip("/")}
+        visited = set()
+        
+        while to_visit:
+            url = to_visit.pop()
+            if url in visited:
+                continue
+            visited.add(url)
+            
+            html = fetch_page(url)
+            if not html:
+                continue
+            
+            # Extract text content for hashing
+            clean_body = _extract_clean_body_html(html)
+            text_content = _extract_text_from_body_html(
+                clean_body,
+                exclude_section_headings=[],
+                exclude_container_class_substrings=[]
+            )
+            content_hash = hashlib.md5(text_content.encode()).hexdigest()
+            title = _extract_title_from_html(html) or url.split("/")[-1]
+            
+            discovered[url] = {
+                "hash": content_hash,
+                "title": title,
+                "text": text_content[:500]  # Store first 500 chars for preview
+            }
+            
+            # Find more links
+            new_links = extract_site7_links(html, BASE_URL)
+            for link in new_links:
+                if link not in visited:
+                    to_visit.add(link)
+            
+            # Rate limiting
+            time.sleep(0.15)
+        
+        return discovered
+    
+    # Crawl the site
+    print("   🔍 Crawling Site7 help center...")
+    current_pages = crawl_site7()
+    
+    print(f"   📊 Found {len(current_pages)} pages")
+    
+    if not current_pages:
+        print("   ⚠️ No pages found - skipping")
+        return False
+    
+    # Load previous snapshot
+    old_snapshot = load_snapshot("site7_helpcenter")
+    
+    current_data = {
+        "pages": current_pages,
+        "urls": sorted(current_pages.keys()),
+        "count": len(current_pages),
+        "last_crawled": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    }
+    
+    if old_snapshot is None:
+        print(f"   📝 First Site7 snapshot ({len(current_pages)} pages)")
+        save_snapshot("site7_helpcenter", current_data)
+        return False
+    
+    old_data = old_snapshot.get("data", {})
+    old_pages = old_data.get("pages", {})
+    old_urls = set(old_data.get("urls", []))
+    current_urls = set(current_pages.keys())
+    
+    changes_detected = False
+    
+    # Check for new pages
+    new_urls = current_urls - old_urls
+    if new_urls:
+        print(f"   🆕 New Site7 pages: {len(new_urls)}")
+        for url in sorted(new_urls)[:5]:
+            title = current_pages[url].get("title", "")
+            print(f"      + {title[:40]}..." if len(title) > 40 else f"      + {title}")
+        changes_detected = True
+        
+        if DISCORD_WEBHOOK_URL:
+            new_items = []
+            for url in sorted(new_urls)[:10]:
+                new_items.append({
+                    "title": current_pages[url].get("title", url.split("/")[-1]),
+                    "url": url
+                })
+            send_new_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site7-Helpcenter",
+                START_URL,
+                new_items
+            )
+    
+    # Check for removed pages
+    removed_urls = old_urls - current_urls
+    if removed_urls:
+        print(f"   🗑️ Removed Site7 pages: {len(removed_urls)}")
+        for url in sorted(removed_urls)[:5]:
+            title = old_pages.get(url, {}).get("title", url.split("/")[-1])
+            print(f"      - {title[:40]}..." if len(title) > 40 else f"      - {title}")
+        changes_detected = True
+        
+        if DISCORD_WEBHOOK_URL:
+            removed_items = []
+            for url in sorted(removed_urls)[:10]:
+                removed_items.append({
+                    "title": old_pages.get(url, {}).get("title", url.split("/")[-1]),
+                    "url": url
+                })
+            send_removed_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site7-Helpcenter",
+                START_URL,
+                removed_items
+            )
+    
+    # Check for content changes on existing pages
+    content_changes = []
+    for url in current_urls & old_urls:
+        old_hash = old_pages.get(url, {}).get("hash", "")
+        new_hash = current_pages[url].get("hash", "")
+        if old_hash and new_hash and old_hash != new_hash:
+            content_changes.append({
+                "url": url,
+                "title": current_pages[url].get("title", url.split("/")[-1])
+            })
+    
+    if content_changes:
+        print(f"   📝 Content changed on {len(content_changes)} pages:")
+        for change in content_changes[:5]:
+            title = change["title"]
+            print(f"      ~ {title[:40]}..." if len(title) > 40 else f"      ~ {title}")
+        changes_detected = True
+        
+        if DISCORD_WEBHOOK_URL:
+            updates = []
+            for change in content_changes[:DISCORD_MAX_CHANGES]:
+                updates.append({
+                    "id": change["url"],
+                    "field": "content",
+                    "type": f"📝 {change['title'][:50]}" if len(change['title']) > 50 else f"📝 {change['title']}",
+                    "details": f"Content changed: {change['url']}"
+                })
+            send_updated_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site7-Helpcenter",
+                START_URL,
+                updates
+            )
+    
+    if changes_detected:
+        save_snapshot("site7_helpcenter", current_data)
+        return True
+    
+    print("   ✅ No Site7 changes detected")
+    return False
+
 def main():
     """Main entry point."""
     # Prevent UnicodeEncodeError on Windows consoles (e.g. cp1252) when printing emojis.
@@ -1449,6 +1652,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking YouTube channel: {e}")
+    
+    # Track Site7 help center (hilfe.drjoedispenza.de) for new pages and content changes
+    try:
+        if track_site7_helpcenter():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error tracking Site7 help center: {e}")
     
     print("\n" + "=" * 60)
     if changes_detected:
