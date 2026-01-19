@@ -221,6 +221,129 @@ def send_build_change_notification(
     )
 
 
+def send_new_route_with_content_notification(
+    webhook_url: str,
+    site_name: str,
+    base_url: str,
+    routes_with_content: List[Dict[str, Any]]
+) -> bool:
+    """
+    Send notification for new routes with page content preview.
+    
+    Args:
+        webhook_url: Discord webhook URL
+        site_name: Name of the site (e.g., "Site1", "Site2")
+        base_url: Base URL of the site
+        routes_with_content: List of dicts with keys:
+            - route: The route path (e.g., "/product/new-item")
+            - full_url: Full URL to the page
+            - status: "live" | "pending" (404/unreachable)
+            - title: Page title (if available)
+            - content_preview: Text preview of page content (if available)
+    """
+    if not webhook_url or not routes_with_content:
+        return False
+    
+    changes = []
+    live_count = 0
+    pending_count = 0
+    
+    for route_info in routes_with_content[:10]:  # Limit to 10 routes
+        route = route_info.get("route", "Unknown")
+        full_url = route_info.get("full_url", base_url + route)
+        status = route_info.get("status", "unknown")
+        title = route_info.get("title", "")
+        content_preview = route_info.get("content_preview", "")
+        
+        if status == "live":
+            live_count += 1
+            # Build details with title and content preview
+            details = f"**[{_truncate(title, 80) if title else route}]({full_url})**\n"
+            if content_preview:
+                # Show a preview of the page content
+                truncated_content = _truncate(content_preview, 600)
+                details += f"```\n{truncated_content}\n```"
+            else:
+                details += "_Kein Textinhalt extrahiert_"
+            
+            changes.append({
+                "type": f"✅ {route}",
+                "details": details
+            })
+        else:
+            pending_count += 1
+            changes.append({
+                "type": f"⏳ {route}",
+                "details": f"**Seite noch nicht erreichbar (404)**\n_Wird in Watch-Liste aufgenommen und weiter beobachtet_\n[Link]({full_url})"
+            })
+    
+    # Build description
+    description_parts = []
+    if live_count > 0:
+        description_parts.append(f"**{live_count}** neue Seite(n) sind bereits live")
+    if pending_count > 0:
+        description_parts.append(f"**{pending_count}** Seite(n) sind noch nicht erreichbar (werden weiter beobachtet)")
+    
+    description = " | ".join(description_parts) if description_parts else "Neue Routen gefunden"
+    
+    return send_discord_notification(
+        webhook_url=webhook_url,
+        title=f"🆕 Neue Routen auf {site_name}!",
+        description=description,
+        changes=changes,
+        page_url=base_url,
+        color=0x00FF00 if live_count > 0 else 0xFFAA00  # Green if live, Orange if pending
+    )
+
+
+def send_pending_route_now_live_notification(
+    webhook_url: str,
+    site_name: str,
+    base_url: str,
+    route_info: Dict[str, Any]
+) -> bool:
+    """
+    Send notification when a previously pending route is now live.
+    
+    Args:
+        webhook_url: Discord webhook URL
+        site_name: Name of the site
+        base_url: Base URL
+        route_info: Dict with route, full_url, title, content_preview, first_seen
+    """
+    if not webhook_url or not route_info:
+        return False
+    
+    route = route_info.get("route", "Unknown")
+    full_url = route_info.get("full_url", base_url + route)
+    title = route_info.get("title", "")
+    content_preview = route_info.get("content_preview", "")
+    first_seen = route_info.get("first_seen", "")
+    
+    details = f"**[{_truncate(title, 80) if title else route}]({full_url})**\n"
+    if first_seen:
+        details += f"_Erstmals entdeckt: {first_seen}_\n\n"
+    if content_preview:
+        truncated_content = _truncate(content_preview, 800)
+        details += f"```\n{truncated_content}\n```"
+    else:
+        details += "_Kein Textinhalt extrahiert_"
+    
+    changes = [{
+        "type": f"✅ Jetzt LIVE: {route}",
+        "details": details
+    }]
+    
+    return send_discord_notification(
+        webhook_url=webhook_url,
+        title=f"🎉 Zuvor wartende Seite ist jetzt live auf {site_name}!",
+        description=f"Eine zuvor entdeckte Route, die nicht erreichbar war, ist jetzt verfügbar.",
+        changes=changes,
+        page_url=full_url,
+        color=0x00FF00  # Green
+    )
+
+
 def send_test_notification(webhook_url: str) -> bool:
     """Send a test notification to verify webhook is working."""
     

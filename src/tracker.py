@@ -34,6 +34,8 @@ from notifier import (
     send_build_change_notification,
     send_test_notification,
     send_new_youtube_video_notification,
+    send_new_route_with_content_notification,
+    send_pending_route_now_live_notification,
 )
 
 
@@ -720,6 +722,196 @@ def track_page(page: PageConfig) -> bool:
     return True
 
 
+# =============================================================================
+# PENDING ROUTES WATCH-LIST (for routes discovered but not yet live)
+# =============================================================================
+
+def _get_pending_routes_path() -> str:
+    """Get the path to the pending routes JSON file."""
+    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+    return os.path.join(SNAPSHOTS_DIR, "pending_routes.json")
+
+
+def _load_pending_routes() -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Load the pending routes watch-list.
+    Returns dict keyed by site name, each value is a list of pending route dicts.
+    """
+    path = _get_pending_routes_path()
+    if not os.path.exists(path):
+        return {}
+    
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️  Error loading pending routes: {e}")
+        return {}
+
+
+def _save_pending_routes(pending: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Save the pending routes watch-list."""
+    path = _get_pending_routes_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(pending, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ Error saving pending routes: {e}")
+
+
+def _fetch_route_content(base_url: str, route: str) -> Dict[str, Any]:
+    """
+    Fetch a route and extract its content.
+    
+    Returns dict with:
+        - status: "live" | "pending" (404/error)
+        - title: Page title (if available)
+        - content_preview: Extracted text content (if available)
+        - http_status: Actual HTTP status code
+    """
+    full_url = base_url.rstrip("/") + route
+    
+    result = {
+        "route": route,
+        "full_url": full_url,
+        "status": "pending",
+        "title": "",
+        "content_preview": "",
+        "http_status": 0,
+    }
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    
+    try:
+        req = urllib.request.Request(full_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result["http_status"] = response.status
+            
+            if response.status == 200:
+                result["status"] = "live"
+                
+                # Read and decode content
+                raw = response.read()
+                if raw[:2] == b"\x1f\x8b":  # gzip magic bytes
+                    try:
+                        raw = gzip.decompress(raw)
+                    except Exception:
+                        pass
+                
+                html = raw.decode("utf-8", errors="replace")
+                
+                # Extract title
+                result["title"] = _extract_title_from_html(html)
+                
+                # Extract body text
+                clean_body = _extract_clean_body_html(html)
+                body_text = _extract_text_from_body_html(clean_body)
+                
+                # Take first ~1500 chars as preview
+                result["content_preview"] = body_text[:1500] if body_text else ""
+            else:
+                result["status"] = "pending"
+                
+    except urllib.error.HTTPError as e:
+        result["http_status"] = e.code
+        result["status"] = "pending"
+        print(f"   ⏳ Route {route}: HTTP {e.code}")
+    except urllib.error.URLError as e:
+        result["status"] = "pending"
+        print(f"   ⏳ Route {route}: URL error - {e.reason}")
+    except Exception as e:
+        result["status"] = "pending"
+        print(f"   ⏳ Route {route}: Error - {e}")
+    
+    return result
+
+
+def track_pending_routes() -> bool:
+    """
+    Check all pending routes to see if any are now live.
+    Sends notifications for routes that become available.
+    Returns True if any route became live.
+    """
+    print("\n📡 Checking pending routes watch-list...")
+    
+    pending = _load_pending_routes()
+    
+    if not pending:
+        print("   ✅ No pending routes to check")
+        return False
+    
+    total_pending = sum(len(routes) for routes in pending.values())
+    print(f"   📋 {total_pending} pending route(s) across {len(pending)} site(s)")
+    
+    changes_detected = False
+    updated_pending = {}
+    
+    for site_name, routes in pending.items():
+        # Determine base URL from site name
+        if site_name == "Site1":
+            base_url = "https://drjoedispenza.com"
+        elif site_name == "Site2":
+            base_url = "https://drjoedispenza.info/s/Drjoedispenza"
+        else:
+            # Try to extract from first route's full_url if available
+            base_url = routes[0].get("base_url", "https://drjoedispenza.com") if routes else ""
+        
+        still_pending = []
+        
+        for route_entry in routes:
+            route = route_entry.get("route", "")
+            first_seen = route_entry.get("first_seen", "")
+            
+            if not route:
+                continue
+            
+            # Rate limiting
+            import time
+            time.sleep(0.3)
+            
+            # Try to fetch the route
+            result = _fetch_route_content(base_url, route)
+            
+            if result["status"] == "live":
+                # Route is now live! Send notification
+                print(f"   🎉 Route now LIVE: {route}")
+                changes_detected = True
+                
+                if DISCORD_WEBHOOK_URL:
+                    send_pending_route_now_live_notification(
+                        DISCORD_WEBHOOK_URL,
+                        site_name,
+                        base_url,
+                        {
+                            "route": route,
+                            "full_url": result["full_url"],
+                            "title": result["title"],
+                            "content_preview": result["content_preview"],
+                            "first_seen": first_seen,
+                        }
+                    )
+            else:
+                # Still pending, keep in list
+                still_pending.append(route_entry)
+                print(f"   ⏳ Still pending: {route}")
+        
+        if still_pending:
+            updated_pending[site_name] = still_pending
+    
+    # Save updated pending list
+    _save_pending_routes(updated_pending)
+    
+    remaining = sum(len(routes) for routes in updated_pending.values())
+    print(f"   📋 {remaining} route(s) still pending")
+    
+    return changes_detected
+
+
 def track_build_manifest() -> bool:
     """Track the build manifest for new routes/deployments."""
     print("\n📡 Tracking: Build Manifest")
@@ -776,13 +968,56 @@ def track_build_manifest() -> bool:
         new_routes = routes - old_routes
         if new_routes:
             print(f"🆕 New routes: {new_routes}")
+            
+            # Fetch content for each new route
+            routes_with_content = []
+            pending_routes_to_add = []
+            
+            import time
+            for route in sorted(new_routes):
+                time.sleep(0.3)  # Rate limiting
+                print(f"   Fetching {route}...")
+                
+                result = _fetch_route_content("https://drjoedispenza.com", route)
+                routes_with_content.append(result)
+                
+                if result["status"] == "pending":
+                    # Add to watch-list
+                    pending_routes_to_add.append({
+                        "route": route,
+                        "base_url": "https://drjoedispenza.com",
+                        "first_seen": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    })
+            
+            # Save pending routes to watch-list
+            if pending_routes_to_add:
+                pending = _load_pending_routes()
+                if "Site1" not in pending:
+                    pending["Site1"] = []
+                # Avoid duplicates
+                existing_routes = {r["route"] for r in pending["Site1"]}
+                for entry in pending_routes_to_add:
+                    if entry["route"] not in existing_routes:
+                        pending["Site1"].append(entry)
+                _save_pending_routes(pending)
+                print(f"   📋 Added {len(pending_routes_to_add)} route(s) to watch-list")
+            
+            # Send notification with content
+            if DISCORD_WEBHOOK_URL:
+                send_new_route_with_content_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site1 (drjoedispenza.com)",
+                    "https://drjoedispenza.com",
+                    routes_with_content
+                )
         
+        # Also send build change notification (for deployment info)
         if DISCORD_WEBHOOK_URL:
             send_build_change_notification(
                 DISCORD_WEBHOOK_URL,
                 old_build_id,
                 build_id,
-                sorted(list(new_routes))
+                []  # Routes are handled separately now
             )
         
         save_snapshot("build_manifest", current_data)
@@ -850,12 +1085,71 @@ def track_build_manifest_site2() -> bool:
     if added_pages:
         print(f"🆕 New Site2 pages: {added_pages}")
         changes_detected = True
+        
+        # Fetch content for each new page
+        routes_with_content = []
+        pending_routes_to_add = []
+        
+        import time
+        for page_slug in sorted(added_pages)[:10]:  # Limit to 10
+            # Site2 pages are accessed via /s/Drjoedispenza/<slug>
+            route = f"/{page_slug}" if page_slug.startswith("/") else f"/{page_slug}"
+            time.sleep(0.3)  # Rate limiting
+            print(f"   Fetching {route}...")
+            
+            # Site2 has a different URL structure
+            full_url = f"https://drjoedispenza.info/s/Drjoedispenza{route}"
+            result = {
+                "route": route,
+                "full_url": full_url,
+                "status": "pending",
+                "title": "",
+                "content_preview": "",
+            }
+            
+            # Try to fetch the page
+            try:
+                html = fetch_page(full_url)
+                if html:
+                    result["status"] = "live"
+                    result["title"] = _extract_title_from_html(html)
+                    clean_body = _extract_clean_body_html(html)
+                    body_text = _extract_text_from_body_html(clean_body)
+                    result["content_preview"] = body_text[:1500] if body_text else ""
+                else:
+                    result["status"] = "pending"
+            except Exception as e:
+                print(f"   ⏳ Error fetching {route}: {e}")
+                result["status"] = "pending"
+            
+            routes_with_content.append(result)
+            
+            if result["status"] == "pending":
+                pending_routes_to_add.append({
+                    "route": route,
+                    "base_url": "https://drjoedispenza.info/s/Drjoedispenza",
+                    "first_seen": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                })
+        
+        # Save pending routes to watch-list
+        if pending_routes_to_add:
+            pending = _load_pending_routes()
+            if "Site2" not in pending:
+                pending["Site2"] = []
+            existing_routes = {r["route"] for r in pending["Site2"]}
+            for entry in pending_routes_to_add:
+                if entry["route"] not in existing_routes:
+                    pending["Site2"].append(entry)
+            _save_pending_routes(pending)
+            print(f"   📋 Added {len(pending_routes_to_add)} route(s) to Site2 watch-list")
+        
+        # Send notification with content
         if DISCORD_WEBHOOK_URL:
-            send_build_change_notification(
+            send_new_route_with_content_notification(
                 DISCORD_WEBHOOK_URL,
-                f"Site2: {len(old_pages)} pages",
-                f"Site2: {len(new_pages)} pages",
-                sorted(list(added_pages))[:10]  # Limit to 10
+                "Site2 (drjoedispenza.info)",
+                "https://drjoedispenza.info/s/Drjoedispenza",
+                routes_with_content
             )
     
     # Check for build ID change
@@ -1677,6 +1971,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking Site7 help center: {e}")
+    
+    # Check pending routes watch-list (routes discovered but not yet live)
+    try:
+        if track_pending_routes():
+            changes_detected = True
+    except Exception as e:
+        print(f"❌ Error checking pending routes: {e}")
     
     print("\n" + "=" * 60)
     if changes_detected:
