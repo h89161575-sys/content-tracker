@@ -1423,7 +1423,7 @@ def track_site7_helpcenter() -> bool:
             discovered[url] = {
                 "hash": content_hash,
                 "title": title,
-                "text": text_content[:500]  # Store first 500 chars for preview
+                "text": text_content  # Store full text for diff calculation
             }
             
             # Find more links
@@ -1536,11 +1536,29 @@ def track_site7_helpcenter() -> bool:
         if DISCORD_WEBHOOK_URL:
             updates = []
             for change in content_changes[:DISCORD_MAX_CHANGES]:
+                details_lines = []
+                details_lines.append(f"**{change['title']}**")
+                details_lines.append(f"URL: {change['url']}")
+                
+                # Get old and new text for diff
+                old_text = old_pages.get(change["url"], {}).get("text", "")
+                new_text = current_pages[change["url"]].get("text", "")
+                
+                if old_text and new_text:
+                    diff_summary = _summarize_text_diff(old_text, new_text, context_lines=0)
+                    if diff_summary:
+                        details_lines.append("Diff (rot = entfernt, grün = neu):")
+                        details_lines.append(diff_summary)
+                    else:
+                        details_lines.append("Hinweis: Kein Textunterschied erkennbar (evtl. nur HTML/Struktur).")
+                else:
+                    details_lines.append("Hinweis: Text-Baseline wurde neu erstellt; Diff ist ab dem nächsten Lauf verfügbar.")
+                
                 updates.append({
                     "id": change["url"],
                     "field": "content",
-                    "type": f"📝 {change['title'][:50]}" if len(change['title']) > 50 else f"📝 {change['title']}",
-                    "details": f"Content changed: {change['url']}"
+                    "type": _truncate_for_discord_field_name(f"📝 {change['title']}"),
+                    "details": "\n".join(details_lines)
                 })
             send_updated_items_notification(
                 DISCORD_WEBHOOK_URL,
