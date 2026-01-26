@@ -431,8 +431,8 @@ def _extract_text_from_body_html(
     return "\n".join(lines)
 
 
-# Site7 help center: filter out "last updated" meta lines to avoid noise.
-_SITE7_HELP_FILTER_VERSION = 1
+# Site7 help center: filter out dynamic meta/related blocks to avoid noise.
+_SITE7_HELP_FILTER_VERSION = 2
 _SITE7_HELP_UPDATED_LINE_RE = re.compile(
     r"^(?:"
     r"(?:heute|gestern|diese woche|letzte woche|diesen monat|letzten monat|dieses jahr|letztes jahr)\s+aktualisiert"
@@ -1739,7 +1739,7 @@ def track_site7_helpcenter() -> bool:
             text_content = _extract_text_from_body_html(
                 clean_body,
                 exclude_section_headings=[],
-                exclude_container_class_substrings=["avatar__info"]
+                exclude_container_class_substrings=["avatar__info", "related_articles"]
             )
             text_content = _filter_site7_helpcenter_text(text_content)
             content_hash = hashlib.md5(text_content.encode()).hexdigest()
