@@ -431,6 +431,36 @@ def _extract_text_from_body_html(
     return "\n".join(lines)
 
 
+# Site7 help center: filter out "last updated" meta lines to avoid noise.
+_SITE7_HELP_FILTER_VERSION = 1
+_SITE7_HELP_UPDATED_LINE_RE = re.compile(
+    r"^(?:"
+    r"(?:heute|gestern|diese woche|letzte woche|diesen monat|letzten monat|dieses jahr|letztes jahr)\s+aktualisiert"
+    r"|vor\s+(?:(?:über|mehr als)\s+)?\d+\s+(?:tag|tage|tagen|woche|wochen|monat|monate|monaten|jahr|jahre|jahren)\s+aktualisiert"
+    r"|vor\s+(?:einem|einer)\s+(?:tag|woche|monat|jahr)\s+aktualisiert"
+    r"|aktualisiert\s+vor\s+.*"
+    r"|zuletzt\s+aktualisiert.*"
+    r"|last\s+updated.*"
+    r"|updated\s+(?:today|yesterday|this week|last week|\d+\s+(?:day|days|week|weeks|month|months|year|years)\s+ago)"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _filter_site7_helpcenter_text(text: str) -> str:
+    if not text:
+        return text
+    cleaned_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _SITE7_HELP_UPDATED_LINE_RE.match(stripped):
+            continue
+        cleaned_lines.append(stripped)
+    return "\n".join(cleaned_lines)
+
+
 def _truncate_for_discord_field_name(text: str, max_length: int = 256) -> str:
     if len(text) <= max_length:
         return text
@@ -1709,8 +1739,9 @@ def track_site7_helpcenter() -> bool:
             text_content = _extract_text_from_body_html(
                 clean_body,
                 exclude_section_headings=[],
-                exclude_container_class_substrings=[]
+                exclude_container_class_substrings=["avatar__info"]
             )
+            text_content = _filter_site7_helpcenter_text(text_content)
             content_hash = hashlib.md5(text_content.encode()).hexdigest()
             title = _extract_title_from_html(html) or url.split("/")[-1]
             
@@ -1743,12 +1774,20 @@ def track_site7_helpcenter() -> bool:
     
     # Load previous snapshot
     old_snapshot = load_snapshot("site7_helpcenter")
+    old_data = old_snapshot.get("data", {}) if old_snapshot else {}
+    old_filter_version = old_data.get("filter_version")
+    baseline_reset = old_snapshot is not None and old_filter_version != _SITE7_HELP_FILTER_VERSION
+    if baseline_reset:
+        print(
+            "   ℹ️ Site7-Filter geändert - Baseline wird aktualisiert, keine Content-Benachrichtigungen in diesem Lauf"
+        )
     
     current_data = {
         "pages": current_pages,
         "urls": sorted(current_pages.keys()),
         "count": len(current_pages),
-        "last_crawled": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        "last_crawled": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "filter_version": _SITE7_HELP_FILTER_VERSION,
     }
     
     if old_snapshot is None:
@@ -1756,7 +1795,6 @@ def track_site7_helpcenter() -> bool:
         save_snapshot("site7_helpcenter", current_data)
         return False
     
-    old_data = old_snapshot.get("data", {})
     old_pages = old_data.get("pages", {})
     old_urls = set(old_data.get("urls", []))
     current_urls = set(current_pages.keys())
@@ -1811,14 +1849,15 @@ def track_site7_helpcenter() -> bool:
     
     # Check for content changes on existing pages
     content_changes = []
-    for url in current_urls & old_urls:
-        old_hash = old_pages.get(url, {}).get("hash", "")
-        new_hash = current_pages[url].get("hash", "")
-        if old_hash and new_hash and old_hash != new_hash:
-            content_changes.append({
-                "url": url,
-                "title": current_pages[url].get("title", url.split("/")[-1])
-            })
+    if not baseline_reset:
+        for url in current_urls & old_urls:
+            old_hash = old_pages.get(url, {}).get("hash", "")
+            new_hash = current_pages[url].get("hash", "")
+            if old_hash and new_hash and old_hash != new_hash:
+                content_changes.append({
+                    "url": url,
+                    "title": current_pages[url].get("title", url.split("/")[-1])
+                })
     
     if content_changes:
         print(f"   📝 Content changed on {len(content_changes)} pages:")
@@ -1861,9 +1900,9 @@ def track_site7_helpcenter() -> bool:
                 updates
             )
     
-    if changes_detected:
+    if changes_detected or baseline_reset:
         save_snapshot("site7_helpcenter", current_data)
-        return True
+        return changes_detected
     
     print("   ✅ No Site7 changes detected")
     return False
