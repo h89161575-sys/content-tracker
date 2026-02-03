@@ -1389,12 +1389,50 @@ def track_sitemap_site1() -> bool:
         changes_detected = True
         
         if DISCORD_WEBHOOK_URL:
-            send_build_change_notification(
-                DISCORD_WEBHOOK_URL,
-                f"Site1: {len(old_urls)} pages",
-                f"Site1: {len(all_urls)} pages (+{len(new_urls)} new)",
-                sorted(list(new_urls))[:10]
-            )
+            from urllib.parse import urlparse
+
+            routes_with_content = []
+            pending_routes_to_add = []
+
+            import time
+            for url in sorted(new_urls):
+                parsed = urlparse(url)
+                if parsed.netloc and parsed.netloc != "drjoedispenza.com":
+                    continue
+
+                route = parsed.path or "/"
+                if parsed.query:
+                    route = f"{route}?{parsed.query}"
+
+                time.sleep(0.3)
+                result = _fetch_route_content("https://drjoedispenza.com", route)
+                routes_with_content.append(result)
+
+                if result["status"] == "pending":
+                    pending_routes_to_add.append({
+                        "route": route,
+                        "base_url": "https://drjoedispenza.com",
+                        "first_seen": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    })
+
+            if pending_routes_to_add:
+                pending = _load_pending_routes()
+                if "Site1" not in pending:
+                    pending["Site1"] = []
+                existing_routes = {r["route"] for r in pending["Site1"]}
+                for entry in pending_routes_to_add:
+                    if entry["route"] not in existing_routes:
+                        pending["Site1"].append(entry)
+                _save_pending_routes(pending)
+                print(f"   ?? Added {len(pending_routes_to_add)} route(s) to watch-list")
+
+            if routes_with_content:
+                send_new_route_with_content_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site1-Sitemap",
+                    "https://drjoedispenza.com",
+                    routes_with_content
+                )
     
     if removed_urls:
         print(f"🗑️ Removed Site1 pages: {len(removed_urls)}")

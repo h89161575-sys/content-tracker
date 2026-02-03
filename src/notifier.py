@@ -101,7 +101,7 @@ def send_new_items_notification(
     changes = []
     for item in new_items[:5]:  # Limit to 5 items
         # Try to extract meaningful info
-        title = item.get("title") or item.get("name") or item.get("_id", "Unknown")
+        title = item.get("title") or item.get("name") or item.get("_id") or item.get("url") or "Unknown"
         status = item.get("status", "")
         start_date = item.get("startDate", "")
         
@@ -175,7 +175,7 @@ def send_removed_items_notification(
     
     changes = []
     for item in removed_items[:5]:
-        title = item.get("title") or item.get("name") or item.get("_id", "Unknown")
+        title = item.get("title") or item.get("name") or item.get("_id") or item.get("url") or "Unknown"
         changes.append({
             "type": "🗑️ Removed",
             "details": f"**{title}**"
@@ -463,7 +463,7 @@ def send_new_items_notification(
     changes = []
     for item in new_items[:5]:  # Limit to 5 items
         # Try to extract meaningful info
-        title = item.get("title") or item.get("name") or item.get("_id", "Unknown")
+        title = item.get("title") or item.get("name") or item.get("_id") or item.get("url") or "Unknown"
         status = item.get("status", "")
         start_date = item.get("startDate", "")
         
@@ -537,7 +537,7 @@ def send_removed_items_notification(
     
     changes = []
     for item in removed_items[:5]:
-        title = item.get("title") or item.get("name") or item.get("_id", "Unknown")
+        title = item.get("title") or item.get("name") or item.get("_id") or item.get("url") or "Unknown"
         changes.append({
             "type": "🗑️ Removed",
             "details": f"**{title}**"
