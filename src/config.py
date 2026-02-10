@@ -116,6 +116,10 @@ PAGES_TO_TRACK = [
         url="https://my.visme.co/view/76r8rk7z-pmx2v48gp96d2qvz#s1",
         data_path="project_data" 
     ),
+    
+    # === Site 7 (Events - events.drjoedispenza.com) ===
+    PageConfig(name="Site7-Home", url="https://events.drjoedispenza.com/", data_path="props.pageProps"),
+    PageConfig(name="Site7-Denver-Retreat", url="https://events.drjoedispenza.com/retreats/denver-weeklong-retreat", data_path="props.pageProps"),
 ]
 
 # === Dynamically load additional Site3 URLs ===
