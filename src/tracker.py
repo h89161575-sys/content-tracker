@@ -942,75 +942,291 @@ def track_pending_routes() -> bool:
     return changes_detected
 
 
+def _parse_build_manifest_chunks(manifest_content: str) -> Dict[str, List[str]]:
+    """
+    Parse _buildManifest.js to extract per-route chunk mappings.
+
+    The manifest uses a compact JS function format like:
+        self.__BUILD_MANIFEST=function(s,e,a,...){return{
+            "/": [s,e,a,"static/chunks/pages/index-abc123.js"],
+            "/retreats": ["static/chunks/pages/retreats-def456.js"],
+            ...
+        }}("static/chunks/120-aaa.js","static/chunks/2084-bbb.js",...)
+
+    This parser resolves the variable references to their actual chunk paths.
+    """
+    # Step 1: Extract the variable parameter names from the function signature
+    func_match = re.search(r'function\(([^)]+)\)\s*\{', manifest_content)
+    if not func_match:
+        return {}
+
+    param_names = [p.strip() for p in func_match.group(1).split(",")]
+
+    # Step 2: Extract the actual argument values at the end of the IIFE call
+    # Pattern: }}("chunk1","chunk2",...)
+    args_match = re.search(r'\}\}\s*\(([^)]+)\)', manifest_content)
+    if not args_match:
+        return {}
+
+    # Parse the argument values (quoted strings)
+    arg_values = re.findall(r'"([^"]*)"', args_match.group(1))
+
+    # Build variable → chunk path mapping
+    var_map: Dict[str, str] = {}
+    for i, name in enumerate(param_names):
+        if i < len(arg_values):
+            var_map[name] = arg_values[i]
+
+    # Step 3: Extract route → chunk array mappings from the return block
+    route_chunks: Dict[str, List[str]] = {}
+
+    # Find the return block content
+    return_match = re.search(r'return\s*\{(.*?),\s*sortedPages\s*:', manifest_content, re.DOTALL)
+    if not return_match:
+        # Fallback: try without sortedPages
+        return_match = re.search(r'return\s*\{(.*)\}\s*\}', manifest_content, re.DOTALL)
+
+    if not return_match:
+        return {}
+
+    return_body = return_match.group(1)
+
+    # Extract each route and its chunk array
+    # Pattern: "/route-name":[items]
+    route_pattern = re.compile(r'"(/[^"]*)":\s*\[([^\]]*)\]')
+    for route_match in route_pattern.finditer(return_body):
+        route = route_match.group(1)
+        items_str = route_match.group(2).strip()
+
+        if not items_str:
+            route_chunks[route] = []
+            continue
+
+        # Parse the array items: mix of variable names and quoted strings
+        chunks: List[str] = []
+        for item in re.findall(r'(?:"([^"]*)")|([a-zA-Z_][a-zA-Z0-9_]*)', items_str):
+            quoted, var_name = item
+            if quoted:
+                chunks.append(quoted)
+            elif var_name and var_name in var_map:
+                chunks.append(var_map[var_name])
+
+        route_chunks[route] = chunks
+
+    return route_chunks
+
+
+def _parse_ssg_manifest(ssg_content: str) -> List[str]:
+    """
+    Parse _ssgManifest.js to extract the list of statically generated pages.
+
+    Format: self.__SSG_MANIFEST=new Set(["\\u002F","\\u002Fretreats",...])
+    The fetched content may contain double-escaped unicode (\\u002F) which
+    we need to decode first.
+    """
+    # First, unescape any \\uXXXX sequences to their actual characters
+    def _unescape_unicode(text: str) -> str:
+        return re.sub(
+            r'\\u([0-9a-fA-F]{4})',
+            lambda m: chr(int(m.group(1), 16)),
+            text,
+        )
+
+    unescaped = _unescape_unicode(ssg_content)
+
+    # Extract content inside Set([...])
+    set_match = re.search(r'new\s+Set\(\[(.*?)\]\)', unescaped, re.DOTALL)
+    if not set_match:
+        return []
+
+    raw = set_match.group(1)
+    # Extract quoted path strings
+    pages = re.findall(r'"([^"]*)"', raw)
+    return sorted(pages)
+
+
+def _diff_route_chunks(
+    old_chunks: Dict[str, List[str]],
+    new_chunks: Dict[str, List[str]],
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Compare per-route chunk mappings between two builds.
+
+    Returns:
+        (changed_routes, new_routes, removed_routes)
+    Where changed_routes are routes whose JS chunks changed (= code changed for that page).
+    """
+    old_routes = set(old_chunks.keys())
+    new_routes_set = set(new_chunks.keys())
+
+    added = sorted(new_routes_set - old_routes)
+    removed = sorted(old_routes - new_routes_set)
+
+    changed: List[str] = []
+    for route in sorted(old_routes & new_routes_set):
+        # Compare only page-specific chunks (filter out shared chunks)
+        old_page = [c for c in old_chunks[route] if "/pages/" in c]
+        new_page = [c for c in new_chunks[route] if "/pages/" in c]
+        if old_page != new_page:
+            changed.append(route)
+
+    return changed, added, removed
+
+
+def _crawl_changed_routes_content(
+    base_url: str,
+    routes: List[str],
+    max_routes: int = 15,
+) -> List[Dict[str, Any]]:
+    """
+    Crawl a list of routes to extract their current content for diff analysis.
+
+    Returns list of dicts with: route, full_url, title, content_preview, status
+    """
+    import time
+
+    results: List[Dict[str, Any]] = []
+    # Filter out internal/dynamic routes that won't resolve
+    skip_patterns = [
+        "[", "]]", "_app", "_error", "404", "robots.txt", "sitemap.xml",
+    ]
+
+    crawlable = [
+        r for r in routes
+        if not any(pat in r for pat in skip_patterns)
+    ][:max_routes]
+
+    for route in crawlable:
+        time.sleep(0.3)
+        result = _fetch_route_content(base_url, route)
+        results.append(result)
+
+    return results
+
+
 def track_build_manifest() -> bool:
-    """Track the build manifest for new routes/deployments."""
-    print("\n📡 Tracking: Build Manifest")
-    
+    """
+    Track the build manifest for new routes/deployments.
+
+    Enhanced with:
+    1. JS-Chunk-Diff: identifies which specific pages changed by comparing chunk filenames
+    2. SSG Manifest tracking: detects changes in statically generated pages
+    3. Full-Crawl on build change: crawls changed routes to extract content diffs
+    """
+    print("\n📡 Tracking: Build Manifest (Enhanced)")
+
     # First, get current build ID from homepage
     html = fetch_page("https://drjoedispenza.com/")
     if not html:
         return False
-    
+
     next_data = extract_next_data(html)
     if not next_data:
         return False
-    
+
     build_id = next_data.get("buildId")
     if not build_id:
         print("⚠️  Could not find buildId")
         return False
-    
+
     print(f"📦 Current buildId: {build_id}")
-    
+
     # Load previous build manifest snapshot
     old_snapshot = load_snapshot("build_manifest")
-    
-    # Fetch build manifest
+
+    # ── Fetch & parse build manifest ──
     manifest_url = f"https://drjoedispenza.com/_next/static/{build_id}/_buildManifest.js"
     manifest_content = fetch_page(manifest_url)
-    
+
     if not manifest_content:
         return False
-    
-    # Extract routes from manifest
-    # Format: self.__BUILD_MANIFEST={...routes...}
+
+    # Extract routes (legacy) and per-route chunk mappings (new)
     routes = set(re.findall(r'"(/[^"]*)"', manifest_content))
-    
+    route_chunks = _parse_build_manifest_chunks(manifest_content)
+    print(f"   📊 Parsed {len(route_chunks)} route-chunk mappings")
+
+    # ── Fetch & parse SSG manifest ──
+    ssg_url = f"https://drjoedispenza.com/_next/static/{build_id}/_ssgManifest.js"
+    ssg_content = fetch_page(ssg_url)
+    ssg_pages: List[str] = []
+    if ssg_content:
+        ssg_pages = _parse_ssg_manifest(ssg_content)
+        print(f"   📊 SSG pages: {len(ssg_pages)}")
+
     current_data = {
         "buildId": build_id,
         "routes": sorted(list(routes)),
-        "manifestHash": hashlib.md5(manifest_content.encode()).hexdigest()
+        "manifestHash": hashlib.md5(manifest_content.encode()).hexdigest(),
+        "routeChunks": {r: chunks for r, chunks in route_chunks.items()},
+        "ssgPages": ssg_pages,
     }
-    
+
     if old_snapshot is None:
         print(f"📝 First build manifest snapshot")
         save_snapshot("build_manifest", current_data)
         return False
-    
+
     old_data = old_snapshot.get("data", {})
     old_build_id = old_data.get("buildId", "")
     old_routes = set(old_data.get("routes", []))
-    
+
     # Check for changes
     if old_build_id != build_id:
         print(f"🔄 Build ID changed: {old_build_id[:20]}... → {build_id[:20]}...")
-        
-        new_routes = routes - old_routes
-        if new_routes:
-            print(f"🆕 New routes: {new_routes}")
-            
-            # Fetch content for each new route
+
+        # ── Strategy 1: JS-Chunk-Diff ──
+        old_route_chunks = old_data.get("routeChunks", {})
+        changed_routes: List[str] = []
+        new_route_list: List[str] = []
+        removed_route_list: List[str] = []
+
+        if old_route_chunks:
+            changed_routes, new_route_list, removed_route_list = _diff_route_chunks(
+                old_route_chunks, route_chunks
+            )
+            if changed_routes:
+                print(f"📝 Pages with code changes: {len(changed_routes)}")
+                for r in changed_routes[:10]:
+                    print(f"   ~ {r}")
+            if new_route_list:
+                print(f"🆕 New routes: {len(new_route_list)}")
+                for r in new_route_list[:10]:
+                    print(f"   + {r}")
+            if removed_route_list:
+                print(f"🗑️  Removed routes: {len(removed_route_list)}")
+                for r in removed_route_list[:10]:
+                    print(f"   - {r}")
+            if not changed_routes and not new_route_list and not removed_route_list:
+                print("   ℹ️  Only shared chunks changed (framework/library update)")
+        else:
+            # First run with chunk tracking – use legacy route comparison
+            new_route_list = sorted(routes - old_routes)
+            if new_route_list:
+                print(f"🆕 New routes (legacy): {new_route_list}")
+
+        # ── Strategy 3: SSG Manifest Diff ──
+        old_ssg_pages = set(old_data.get("ssgPages", []))
+        new_ssg_pages = set(ssg_pages) - old_ssg_pages
+        removed_ssg_pages = old_ssg_pages - set(ssg_pages)
+        if new_ssg_pages:
+            print(f"📄 New SSG pages: {sorted(new_ssg_pages)}")
+        if removed_ssg_pages:
+            print(f"📄 Removed SSG pages: {sorted(removed_ssg_pages)}")
+
+        # ── Fetch content for NEW routes ──
+        if new_route_list:
             routes_with_content = []
             pending_routes_to_add = []
-            
+
             import time
-            for route in sorted(new_routes):
+            for route in sorted(new_route_list):
                 time.sleep(0.3)  # Rate limiting
                 print(f"   Fetching {route}...")
-                
+
                 result = _fetch_route_content("https://drjoedispenza.com", route)
                 routes_with_content.append(result)
-                
+
                 if result["status"] == "pending":
                     # Add to watch-list
                     pending_routes_to_add.append({
@@ -1018,7 +1234,7 @@ def track_build_manifest() -> bool:
                         "base_url": "https://drjoedispenza.com",
                         "first_seen": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                     })
-            
+
             # Save pending routes to watch-list
             if pending_routes_to_add:
                 pending = _load_pending_routes()
@@ -1031,7 +1247,7 @@ def track_build_manifest() -> bool:
                         pending["Site1"].append(entry)
                 _save_pending_routes(pending)
                 print(f"   📋 Added {len(pending_routes_to_add)} route(s) to watch-list")
-            
+
             # Send notification with content
             if DISCORD_WEBHOOK_URL:
                 send_new_route_with_content_notification(
@@ -1040,19 +1256,34 @@ def track_build_manifest() -> bool:
                     "https://drjoedispenza.com",
                     routes_with_content
                 )
-        
-        # Also send build change notification (for deployment info)
+
+        # ── Strategy 2: Full-crawl of CHANGED routes ──
+        crawled_changes: List[Dict[str, Any]] = []
+        if changed_routes:
+            print(f"   🔍 Crawling {min(len(changed_routes), 15)} changed route(s) for content diff...")
+            crawled_changes = _crawl_changed_routes_content(
+                "https://drjoedispenza.com",
+                changed_routes,
+                max_routes=15,
+            )
+
+        # ── Send enhanced build change notification ──
         if DISCORD_WEBHOOK_URL:
             send_build_change_notification(
                 DISCORD_WEBHOOK_URL,
                 old_build_id,
                 build_id,
-                []  # Routes are handled separately now
+                new_route_list,
+                changed_routes=changed_routes,
+                removed_routes=removed_route_list,
+                crawled_changes=crawled_changes,
+                new_ssg_pages=sorted(new_ssg_pages) if new_ssg_pages else [],
+                removed_ssg_pages=sorted(removed_ssg_pages) if removed_ssg_pages else [],
             )
-        
+
         save_snapshot("build_manifest", current_data)
         return True
-    
+
     print("✅ No build changes")
     return False
 

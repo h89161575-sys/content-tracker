@@ -195,26 +195,92 @@ def send_build_change_notification(
     webhook_url: str,
     old_build_id: str,
     new_build_id: str,
-    new_routes: List[str]
+    new_routes: List[str],
+    *,
+    changed_routes: Optional[List[str]] = None,
+    removed_routes: Optional[List[str]] = None,
+    crawled_changes: Optional[List[Dict[str, Any]]] = None,
+    new_ssg_pages: Optional[List[str]] = None,
+    removed_ssg_pages: Optional[List[str]] = None,
 ) -> bool:
-    """Send notification when build ID changes (new deployment)."""
-    
-    changes = [{
+    """Send enhanced notification when build ID changes (new deployment).
+
+    Now includes:
+    - Which specific pages had code changes (JS-Chunk-Diff)
+    - New/removed SSG pages
+    - Content previews for crawled changed routes
+    """
+
+    changes: List[Dict[str, Any]] = [{
         "type": "🏗️ Build ID",
         "details": f"`{old_build_id[:20]}...` → `{new_build_id[:20]}...`"
     }]
-    
+
+    # ── Changed pages (JS-Chunk-Diff) ──
+    if changed_routes:
+        routes_text = "\n".join([f"• `{r}`" for r in changed_routes[:15]])
+        if len(changed_routes) > 15:
+            routes_text += f"\n_... und {len(changed_routes) - 15} weitere_"
+        changes.append({
+            "type": f"📝 Code-Änderungen auf {len(changed_routes)} Seite(n)",
+            "details": routes_text
+        })
+
+    # ── New routes ──
     if new_routes:
         routes_text = "\n".join([f"• `{r}`" for r in new_routes[:10]])
         changes.append({
-            "type": "🆕 New Routes Found",
+            "type": "🆕 Neue Routen",
             "details": routes_text
         })
-    
+
+    # ── Removed routes ──
+    if removed_routes:
+        routes_text = "\n".join([f"• `{r}`" for r in removed_routes[:10]])
+        changes.append({
+            "type": "🗑️ Entfernte Routen",
+            "details": routes_text
+        })
+
+    # ── SSG manifest changes ──
+    if new_ssg_pages:
+        ssg_text = "\n".join([f"• `{p}`" for p in new_ssg_pages[:10]])
+        changes.append({
+            "type": "📄 Neue SSG-Seiten",
+            "details": ssg_text
+        })
+    if removed_ssg_pages:
+        ssg_text = "\n".join([f"• `{p}`" for p in removed_ssg_pages[:10]])
+        changes.append({
+            "type": "📄 Entfernte SSG-Seiten",
+            "details": ssg_text
+        })
+
+    # ── Crawled content previews ──
+    if crawled_changes:
+        live_pages = [c for c in crawled_changes if c.get("status") == "live"]
+        for page in live_pages[:5]:
+            title = page.get("title", page.get("route", "?"))
+            preview = page.get("content_preview", "")
+            detail = f"**[{_truncate(title, 80)}]({page.get('full_url', '')})** "
+            if preview:
+                detail += f"\n```\n{_truncate(preview, 300)}\n```"
+            changes.append({
+                "type": f"🔍 {_truncate(page.get('route', '?'), 60)}",
+                "details": detail
+            })
+
+    # ── Build description summary ──
+    desc_parts = ["Die Website wurde neu deployed."]
+    if changed_routes:
+        desc_parts.append(f"**{len(changed_routes)}** Seite(n) mit Code-Änderungen erkannt.")
+    if not changed_routes and not new_routes and not removed_routes:
+        desc_parts.append("Nur Build-Infrastruktur / shared Chunks geändert.")
+
     return send_discord_notification(
         webhook_url=webhook_url,
-        title="Website Deployment Detected!",
-        description="The website has been redeployed. This could mean new features or content.",
+        title="🔔 Website Deployment Detected!",
+        description=" ".join(desc_parts),
         changes=changes,
         page_url="https://drjoedispenza.com",
         color=0x9B59B6  # Purple
@@ -553,34 +619,8 @@ def send_removed_items_notification(
     )
 
 
-def send_build_change_notification(
-    webhook_url: str,
-    old_build_id: str,
-    new_build_id: str,
-    new_routes: List[str]
-) -> bool:
-    """Send notification when build ID changes (new deployment)."""
-    
-    changes = [{
-        "type": "🏗️ Build ID",
-        "details": f"`{old_build_id[:20]}...` → `{new_build_id[:20]}...`"
-    }]
-    
-    if new_routes:
-        routes_text = "\n".join([f"• `{r}`" for r in new_routes[:10]])
-        changes.append({
-            "type": "🆕 New Routes Found",
-            "details": routes_text
-        })
-    
-    return send_discord_notification(
-        webhook_url=webhook_url,
-        title="Website Deployment Detected!",
-        description="The website has been redeployed. This could mean new features or content.",
-        changes=changes,
-        page_url="https://drjoedispenza.com",
-        color=0x9B59B6  # Purple
-    )
+# NOTE: Primary send_build_change_notification is defined above (line ~194).
+# This duplicate was removed to avoid divergence.
 
 
 def send_test_notification(webhook_url: str) -> bool:
