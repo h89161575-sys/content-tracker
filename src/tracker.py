@@ -9,9 +9,10 @@ import sys
 import hashlib
 import zlib
 from datetime import datetime, timezone
-from html import unescape
+from html import escape, unescape
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -431,6 +432,162 @@ def _extract_text_from_body_html(
     return "\n".join(lines)
 
 
+def _extract_route_preview_text_from_html(html: str) -> str:
+    """
+    Extract a concise route preview from HTML.
+
+    Strategy:
+    1) Prefer <main> content when available.
+    2) Otherwise remove header/nav/footer wrappers to avoid shell-only previews.
+    3) Fall back to full body extraction.
+    """
+    clean_body = _extract_clean_body_html(html)
+
+    main_match = re.search(r"<main[^>]*>(.*?)</main>", clean_body, re.DOTALL | re.IGNORECASE)
+    if main_match:
+        main_text = _extract_text_from_body_html(main_match.group(1))
+        if main_text:
+            return main_text
+
+    without_shell = re.sub(
+        r"<(header|nav|footer)\b[^>]*>.*?</\1>",
+        "",
+        clean_body,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    shell_reduced_text = _extract_text_from_body_html(without_shell)
+    if shell_reduced_text:
+        return shell_reduced_text
+
+    return _extract_text_from_body_html(clean_body)
+
+
+# Site1 product-detail pages (drjoedispenza.com) load product text client-side via
+# MongoDB App Services. Calling the same function gives us meaningful preview text.
+_SITE1_REALM_BASE_URLS = [
+    "https://us-east-1.aws.services.cloud.mongodb.com/api/client/v2.0/app/production-lzmdf",
+    "https://services.cloud.mongodb.com/api/client/v2.0/app/production-lzmdf",
+]
+
+
+def _call_site1_realm_function(function_name: str, arguments: List[Any]) -> Optional[Any]:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    for base_url in _SITE1_REALM_BASE_URLS:
+        try:
+            login_req = urllib.request.Request(
+                f"{base_url}/auth/providers/anon-user/login",
+                data=b"{}",
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(login_req, timeout=20) as login_response:
+                login_text = login_response.read().decode("utf-8", errors="replace")
+            login_data = json.loads(login_text)
+
+            access_token = login_data.get("access_token")
+            if not access_token:
+                continue
+
+            payload = {
+                "name": function_name,
+                "arguments": arguments,
+            }
+            call_req = urllib.request.Request(
+                f"{base_url}/functions/call",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    **headers,
+                    "Authorization": f"Bearer {access_token}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(call_req, timeout=20) as call_response:
+                call_text = call_response.read().decode("utf-8", errors="replace")
+            return json.loads(call_text)
+        except urllib.error.HTTPError as e:
+            # Region mismatch: try next base URL.
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            if e.code == 404 and "App not available in requested region" in body:
+                continue
+        except Exception:
+            continue
+
+    return None
+
+
+def _build_site1_product_preview_text(product_data: Dict[str, Any]) -> str:
+    product_details = product_data.get("productDetails")
+    if not isinstance(product_details, dict):
+        return ""
+
+    fragments: List[str] = []
+
+    short_description = product_details.get("shortDescription")
+    if isinstance(short_description, str) and short_description.strip():
+        fragments.append(short_description)
+
+    long_description = product_details.get("longDescription")
+    if isinstance(long_description, list):
+        for section in long_description:
+            if not isinstance(section, dict):
+                continue
+            section_title = str(section.get("title") or "").strip()
+            content_html = section.get("content")
+            if not isinstance(content_html, str) or not content_html.strip():
+                continue
+
+            section_parts: List[str] = []
+            if section_title:
+                section_parts.append(f"<h3>{escape(section_title)}</h3>")
+            section_parts.append(content_html)
+            fragments.append("<section>" + "".join(section_parts) + "</section>")
+
+    if not fragments:
+        return ""
+
+    return _extract_text_from_body_html("<div>" + "".join(fragments) + "</div>")
+
+
+def _fetch_site1_product_preview_from_api(route: str) -> Optional[Dict[str, str]]:
+    parsed = urllib.parse.urlparse(route)
+    route_path = parsed.path or route.split("?", 1)[0]
+
+    marker = "/product-details/"
+    if not route_path.startswith(marker):
+        return None
+
+    product_slug = urllib.parse.unquote(route_path[len(marker):]).strip()
+    if not product_slug:
+        return None
+
+    product_payload = _call_site1_realm_function(
+        "getProductWithInventorySnapshot",
+        [product_slug, False, False],
+    )
+    if not isinstance(product_payload, dict):
+        return None
+
+    title = str(product_payload.get("title") or "").strip()
+    preview_text = _build_site1_product_preview_text(product_payload)
+
+    if not title and not preview_text:
+        return None
+
+    return {
+        "title": title,
+        "text": preview_text,
+    }
+
+
 # Site7 help center: filter out dynamic meta/related blocks to avoid noise.
 _SITE7_HELP_FILTER_VERSION = 2
 _SITE7_HELP_UPDATED_LINE_RE = re.compile(
@@ -838,12 +995,24 @@ def _fetch_route_content(base_url: str, route: str) -> Dict[str, Any]:
                 # Extract title
                 result["title"] = _extract_title_from_html(html)
                 
-                # Extract body text
-                clean_body = _extract_clean_body_html(html)
-                body_text = _extract_text_from_body_html(clean_body)
+                # Extract route preview text from HTML (prefer main content, reduce shell noise).
+                body_text = _extract_route_preview_text_from_html(html)
+
+                # Site1 product-detail routes render core content client-side.
+                # Pull product text from the same backend function used by the frontend.
+                product_preview = None
+                if "drjoedispenza.com" in base_url.lower():
+                    product_preview = _fetch_site1_product_preview_from_api(route)
+                if product_preview:
+                    api_title = product_preview.get("title", "").strip()
+                    api_text = product_preview.get("text", "").strip()
+                    if api_title:
+                        result["title"] = api_title
+                    if api_text:
+                        body_text = api_text
                 
-                # Take first ~1500 chars as preview
-                result["content_preview"] = body_text[:1500] if body_text else ""
+                # Take first ~2000 chars as preview
+                result["content_preview"] = body_text[:2000] if body_text else ""
             else:
                 result["status"] = "pending"
                 
@@ -1376,7 +1545,7 @@ def track_build_manifest_site2() -> bool:
                     result["title"] = _extract_title_from_html(html)
                     clean_body = _extract_clean_body_html(html)
                     body_text = _extract_text_from_body_html(clean_body)
-                    result["content_preview"] = body_text[:1500] if body_text else ""
+                    result["content_preview"] = body_text[:2000] if body_text else ""
                 else:
                     result["status"] = "pending"
             except Exception as e:
