@@ -143,9 +143,9 @@ if os.path.exists(_SITE3_URLS_FILE):
                                 data_path="props.pageProps" # Will fallback to HTML tracking anyway
                             )
                         )
-        print(f"✅ Loaded additional Site3 URLs from {_SITE3_URLS_FILE}")
+        print(f"[config] Loaded additional Site3 URLs from {_SITE3_URLS_FILE}")
     except Exception as e:
-        print(f"⚠️ Error loading site3_all_urls.txt: {e}")
+        print(f"[config] Error loading site3_all_urls.txt: {e}")
 
 # Discord Webhook URL - set via environment variable
 DISCORD_WEBHOOK_URL: Optional[str] = os.environ.get("DISCORD_WEBHOOK_URL")

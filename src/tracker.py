@@ -89,6 +89,75 @@ def fetch_page(url: str) -> Optional[str]:
         return None
 
 
+def fetch_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: Optional[Any] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> Optional[Any]:
+    """Fetch JSON from a URL."""
+    request_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+
+    try:
+        req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read()
+
+            content_encoding = (response.headers.get("Content-Encoding") or "").lower()
+            if "gzip" in content_encoding or raw[:2] == b"\x1f\x8b":
+                try:
+                    raw = gzip.decompress(raw)
+                except Exception:
+                    pass
+            elif "deflate" in content_encoding:
+                try:
+                    raw = zlib.decompress(raw)
+                except Exception:
+                    try:
+                        raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    except Exception:
+                        pass
+
+            charset = None
+            try:
+                charset = response.headers.get_content_charset()  # type: ignore[attr-defined]
+            except Exception:
+                charset = None
+
+            return json.loads(raw.decode(charset or "utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        print(f"âŒ HTTP error fetching JSON {url}: {e.code} {body[:200]}")
+        return None
+    except urllib.error.URLError as e:
+        print(f"âŒ URL error fetching JSON {url}: {e.reason}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"âŒ JSON decode error fetching {url}: {e}")
+        return None
+    except Exception as e:
+        print(f"âŒ Error fetching JSON {url}: {e}")
+        return None
+
+
 def extract_next_data(html: str) -> Optional[Dict[str, Any]]:
     """Extract __NEXT_DATA__ JSON from HTML."""
     pattern = r'<script\s+id="__NEXT_DATA__"\s+type="application/json"[^>]*>(.*?)</script>'
@@ -468,6 +537,9 @@ _SITE1_REALM_BASE_URLS = [
     "https://us-east-1.aws.services.cloud.mongodb.com/api/client/v2.0/app/production-lzmdf",
     "https://services.cloud.mongodb.com/api/client/v2.0/app/production-lzmdf",
 ]
+_SITE1_APP_RUNNER_BASE_URL = "https://8jmuszggp2.us-east-1.awsapprunner.com/api/v1"
+_SITE1_SHOP_URL = "https://drjoedispenza.com/shop/categories?shopSection=All%20Products"
+_SITE1_SHOP_COLLECTION_STATUSES = ["Active", "Coming Soon"]
 
 
 def _call_site1_realm_function(function_name: str, arguments: List[Any]) -> Optional[Any]:
@@ -522,6 +594,141 @@ def _call_site1_realm_function(function_name: str, arguments: List[Any]) -> Opti
             continue
 
     return None
+
+
+def _extract_object_id(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("$oid", "_id", "id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _fetch_site1_collection_product_ids() -> Optional[Tuple[List[str], List[str]]]:
+    collections_payload = _call_site1_realm_function(
+        "fetchProductCollections",
+        [1, 200, None, "", _SITE1_SHOP_COLLECTION_STATUSES, []],
+    )
+    if not isinstance(collections_payload, list):
+        return None
+
+    collection_names: List[str] = []
+    product_ids = set()
+    for collection in collections_payload:
+        if not isinstance(collection, dict):
+            continue
+
+        collection_name = str(collection.get("name") or "").strip()
+        if collection_name:
+            collection_names.append(collection_name)
+
+        products = collection.get("products")
+        if not isinstance(products, list):
+            continue
+
+        for product_ref in products:
+            product_id = _extract_object_id(product_ref)
+            if product_id:
+                product_ids.add(product_id)
+
+    return sorted(product_ids), sorted(set(collection_names))
+
+
+def _project_site1_inventory_variant(variant: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(variant, dict):
+        return None
+
+    projected = {
+        "variantId": variant.get("variantId"),
+        "options": variant.get("options"),
+        "sku": variant.get("sku"),
+        "barcode": variant.get("barcode"),
+        "pricing": variant.get("pricing"),
+        "inventoryCost": variant.get("inventoryCost"),
+    }
+    return normalize_data(projected)
+
+
+def _project_site1_inventory_product(product: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(product, dict):
+        return None
+
+    product_id = _extract_object_id(product.get("_id"))
+    if not product_id:
+        return None
+
+    product_details = product.get("productDetails")
+    short_description = ""
+    if isinstance(product_details, dict):
+        short_description = str(product_details.get("shortDescription") or "").strip()
+
+    variants: List[Dict[str, Any]] = []
+    raw_variants = product.get("variants")
+    if isinstance(raw_variants, list):
+        for raw_variant in raw_variants:
+            projected_variant = _project_site1_inventory_variant(raw_variant)
+            if projected_variant:
+                variants.append(projected_variant)
+        variants.sort(key=lambda item: str(item.get("variantId") or ""))
+
+    projected = {
+        "_id": product_id,
+        "title": product.get("title"),
+        "status": product.get("status"),
+        "type": product.get("type"),
+        "availableOnUnlimited": product.get("availableOnUnlimited"),
+        "visibleOnUnlimited": product.get("visibleOnUnlimited"),
+        "categories": product.get("categories"),
+        "collections": product.get("collections"),
+        "pricing": product.get("pricing"),
+        "options": product.get("options"),
+        "variants": variants,
+        "restrictions": product.get("restrictions"),
+        "images": product.get("images"),
+        "originalPublishedDate": product.get("originalPublishedDate"),
+        "shortDescription": short_description,
+    }
+    return normalize_data(projected)
+
+
+def _fetch_site1_inventory_snapshot_data() -> Optional[Dict[str, Any]]:
+    collection_result = _fetch_site1_collection_product_ids()
+    if not collection_result:
+        return None
+
+    product_ids, collection_names = collection_result
+    if not product_ids:
+        return None
+
+    response = fetch_json(
+        f"{_SITE1_APP_RUNNER_BASE_URL}/products/inventory/snapshot",
+        method="POST",
+        payload={"productIds": product_ids},
+    )
+    if not isinstance(response, dict):
+        return None
+
+    response_data = response.get("data")
+    if not isinstance(response_data, list):
+        return None
+
+    products: List[Dict[str, Any]] = []
+    for raw_product in response_data:
+        projected_product = _project_site1_inventory_product(raw_product)
+        if projected_product:
+            products.append(projected_product)
+
+    products.sort(key=lambda item: str(item.get("_id") or ""))
+
+    return {
+        "products": products,
+        "productIds": product_ids,
+        "collectionNames": collection_names,
+        "count": len(products),
+    }
 
 
 def _build_site1_product_preview_text(product_data: Dict[str, Any]) -> str:
@@ -906,6 +1113,84 @@ def track_page(page: PageConfig) -> bool:
     # Save new snapshot
     save_snapshot(page.name, page_data)
     
+    return True
+
+
+def track_site1_inventory_api() -> bool:
+    """
+    Track Site1 shop inventory directly via the public API.
+
+    Product IDs come from the public collection function the frontend uses, then
+    the App Runner inventory endpoint returns the current product metadata.
+    """
+    print("\nðŸ“¡ Tracking: Site1 Shop Inventory API")
+
+    current_data = _fetch_site1_inventory_snapshot_data()
+    if not current_data:
+        print("âš ï¸  Could not fetch Site1 inventory snapshot data")
+        return False
+
+    current_products = current_data.get("products", [])
+    print(
+        f"   ðŸ“Š Inventory snapshot returned {len(current_products)} products from "
+        f"{len(current_data.get('collectionNames', []))} collections"
+    )
+
+    old_snapshot = load_snapshot("site1_inventory_api")
+    if old_snapshot is None:
+        print(f"ðŸ“ First inventory API snapshot ({len(current_products)} products)")
+        save_snapshot("site1_inventory_api", current_data)
+        return False
+
+    old_data = old_snapshot.get("data", {})
+    old_products = old_data.get("products", []) if isinstance(old_data, dict) else []
+
+    if compute_hash(old_products) == compute_hash(current_products):
+        print("âœ… No inventory API changes")
+        if (
+            old_data.get("productIds") != current_data.get("productIds")
+            or old_data.get("collectionNames") != current_data.get("collectionNames")
+        ):
+            save_snapshot("site1_inventory_api", current_data)
+        return False
+
+    old_items = get_items_by_id(old_products)
+    new_items = get_items_by_id(current_products)
+    added, updated, removed = compare_items(old_items, new_items)
+
+    print(
+        f"ðŸ”„ Inventory API changes detected: +{len(added)} "
+        f"~{len(updated)} -{len(removed)}"
+    )
+
+    if DISCORD_WEBHOOK_URL:
+        if added:
+            send_new_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Inventory-API",
+                _SITE1_SHOP_URL,
+                added,
+            )
+
+        if updated:
+            send_updated_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Inventory-API",
+                _SITE1_SHOP_URL,
+                updated,
+            )
+
+        if removed:
+            send_removed_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Inventory-API",
+                _SITE1_SHOP_URL,
+                removed,
+            )
+    else:
+        print("âš ï¸  No Discord webhook configured - skipping notifications")
+
+    save_snapshot("site1_inventory_api", current_data)
     return True
 
 
@@ -2435,6 +2720,13 @@ def main():
     except Exception as e:
         print(f"❌ Error tracking Site1 content: {e}")
     
+    # Track Site1 shop inventory directly via API
+    try:
+        if track_site1_inventory_api():
+            changes_detected = True
+    except Exception as e:
+        print(f"âŒ Error tracking Site1 inventory API: {e}")
+
     # Track YouTube channel for new videos
     try:
         if track_youtube_channel():
