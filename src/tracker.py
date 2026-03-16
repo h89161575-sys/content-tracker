@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import hashlib
+import secrets
 import zlib
 from datetime import datetime, timezone
 from html import escape, unescape
@@ -540,6 +541,18 @@ _SITE1_REALM_BASE_URLS = [
 _SITE1_APP_RUNNER_BASE_URL = "https://8jmuszggp2.us-east-1.awsapprunner.com/api/v1"
 _SITE1_SHOP_URL = "https://drjoedispenza.com/shop/categories?shopSection=All%20Products"
 _SITE1_SHOP_COLLECTION_STATUSES = ["Active", "Coming Soon"]
+_MYMM_REALM_BASE_URL = "https://us-east-1.aws.realm.mongodb.com/api/client/v2.0/app/production-lzmdf"
+_MYMM_EVENTS_REFERENCE_URL = "https://events.drjoedispenza.com/"
+_MYMM_APP_LOGIN_PAYLOAD = {
+    "application": "mymm",
+    "options": {
+        "device": {
+            "sdkVersion": "1.7.0",
+            "platform": "react-native",
+            "platformVersion": "0.0.0",
+        }
+    },
+}
 
 
 def _call_site1_realm_function(function_name: str, arguments: List[Any]) -> Optional[Any]:
@@ -728,6 +741,189 @@ def _fetch_site1_inventory_snapshot_data() -> Optional[Dict[str, Any]]:
         "productIds": product_ids,
         "collectionNames": collection_names,
         "count": len(products),
+    }
+
+
+def _get_mymm_identity_path() -> str:
+    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+    return os.path.join(SNAPSHOTS_DIR, "mymm_client_identity.json")
+
+
+def _load_or_create_mymm_identity() -> Dict[str, str]:
+    env_device_id = os.environ.get("MYMM_DEVICE_ID", "").strip()
+    env_unique_user_key = os.environ.get("MYMM_UNIQUE_USER_KEY", "").strip()
+    if env_device_id and env_unique_user_key:
+        return {
+            "deviceId": env_device_id,
+            "uniqueUserKey": env_unique_user_key,
+        }
+
+    path = _get_mymm_identity_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            device_id = str(data.get("deviceId") or "").strip()
+            unique_user_key = str(data.get("uniqueUserKey") or "").strip()
+            if device_id and unique_user_key:
+                return {
+                    "deviceId": device_id,
+                    "uniqueUserKey": unique_user_key,
+                }
+        except Exception:
+            pass
+
+    identity = {
+        "deviceId": secrets.token_hex(8),
+        "uniqueUserKey": hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(identity, f, indent=2)
+    return identity
+
+
+def _login_mymm_app() -> Optional[str]:
+    identity = _load_or_create_mymm_identity()
+    payload = {
+        **_MYMM_APP_LOGIN_PAYLOAD,
+        "deviceId": identity["deviceId"],
+        "uniqueUserKey": identity["uniqueUserKey"],
+    }
+
+    response = fetch_json(
+        f"{_MYMM_REALM_BASE_URL}/auth/providers/custom-function/login",
+        method="POST",
+        payload=payload,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "okhttp/4.9.1",
+        },
+    )
+    if not isinstance(response, dict):
+        return None
+
+    access_token = response.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        return None
+    return access_token
+
+
+def _call_mymm_realm_function(function_name: str, arguments: List[Any]) -> Optional[Any]:
+    access_token = _login_mymm_app()
+    if not access_token:
+        return None
+
+    return fetch_json(
+        f"{_MYMM_REALM_BASE_URL}/functions/call",
+        method="POST",
+        payload={
+            "name": function_name,
+            "arguments": arguments,
+            "service": "mainCluster",
+        },
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "okhttp/4.9.1",
+        },
+    )
+
+
+def _extract_realm_epoch_ms(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    if isinstance(value, dict):
+        if "$numberLong" in value:
+            raw_value = value.get("$numberLong")
+            if isinstance(raw_value, str) and raw_value.strip().isdigit():
+                return int(raw_value.strip())
+        if "$date" in value:
+            return _extract_realm_epoch_ms(value.get("$date"))
+    return None
+
+
+def _realm_epoch_ms_to_iso(value: Any) -> str:
+    timestamp_ms = _extract_realm_epoch_ms(value)
+    if timestamp_ms is None:
+        return ""
+    return datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _project_mymm_event(event: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(event, dict):
+        return None
+
+    event_id = _extract_object_id(event.get("_id"))
+    if not event_id:
+        return None
+
+    image_value = (
+        event.get("image")
+        or event.get("imageUrl")
+        or event.get("thumbnail")
+        or event.get("cardImage")
+        or event.get("coverImage")
+    )
+
+    projected = {
+        "_id": event_id,
+        "name": str(event.get("name") or "").strip(),
+        "subTitle": str(event.get("subTitle") or "").strip(),
+        "status": event.get("status"),
+        "eventType": event.get("eventType"),
+        "startDate": _realm_epoch_ms_to_iso(event.get("startDate")),
+        "endDate": _realm_epoch_ms_to_iso(event.get("endDate")),
+        "image": image_value,
+    }
+    return normalize_data(projected)
+
+
+def _fetch_mymm_all_events_data() -> Optional[Dict[str, Any]]:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    events_payload = _call_mymm_realm_function(
+        "find",
+        [
+            {
+                "database": "MainDB",
+                "collection": "mymmEvents",
+                "query": {
+                    "endDate": {
+                        "$gte": {
+                            "$date": {
+                                "$numberLong": str(now_ms),
+                            }
+                        }
+                    }
+                },
+                "project": {},
+                "sort": {},
+            }
+        ],
+    )
+    if not isinstance(events_payload, list):
+        return None
+
+    events: List[Dict[str, Any]] = []
+    for raw_event in events_payload:
+        projected_event = _project_mymm_event(raw_event)
+        if projected_event:
+            events.append(projected_event)
+
+    events.sort(
+        key=lambda item: (
+            str(item.get("startDate") or ""),
+            str(item.get("name") or ""),
+            str(item.get("_id") or ""),
+        )
+    )
+
+    return {
+        "events": events,
+        "count": len(events),
     }
 
 
@@ -944,6 +1140,17 @@ def save_snapshot(page_name: str, data: Dict[str, Any]) -> None:
         json.dump(snapshot, f, indent=2, ensure_ascii=False)
     
     print(f"💾 Saved snapshot for {page_name}")
+
+def _save_snapshot_ascii(page_name: str, data: Dict[str, Any]) -> None:
+    """Save a snapshot without emoji output for Windows cp1252 consoles."""
+    path = get_snapshot_path(page_name)
+    snapshot = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "data": data,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, indent=2, ensure_ascii=False)
+    print(f"[snapshot] Saved snapshot for {page_name}")
 
 
 def get_items_by_id(data: Any) -> Dict[str, Any]:
@@ -1191,6 +1398,71 @@ def track_site1_inventory_api() -> bool:
         print("âš ï¸  No Discord webhook configured - skipping notifications")
 
     save_snapshot("site1_inventory_api", current_data)
+    return True
+
+
+def track_mymm_app_events() -> bool:
+    """Track the public event list shown in the Making Your Mind Matter app."""
+    print("\n[app] Tracking: MyMM App Events")
+
+    current_data = _fetch_mymm_all_events_data()
+    if not current_data:
+        print("[app] Could not fetch MyMM app event list")
+        return False
+
+    current_events = current_data.get("events", [])
+    print(f"[app] Event list returned {len(current_events)} active event(s)")
+
+    old_snapshot = load_snapshot("mymm_app_events")
+    if old_snapshot is None:
+        print(f"[app] First MyMM app event snapshot ({len(current_events)} events)")
+        _save_snapshot_ascii("mymm_app_events", current_data)
+        return False
+
+    old_data = old_snapshot.get("data", {})
+    old_events = old_data.get("events", []) if isinstance(old_data, dict) else []
+
+    if compute_hash(old_events) == compute_hash(current_events):
+        print("[app] No MyMM app event changes")
+        return False
+
+    old_items = get_items_by_id(old_events)
+    new_items = get_items_by_id(current_events)
+    added, updated, removed = compare_items(old_items, new_items)
+
+    print(
+        f"[app] MyMM app event changes detected: +{len(added)} "
+        f"~{len(updated)} -{len(removed)}"
+    )
+
+    if DISCORD_WEBHOOK_URL:
+        if added:
+            send_new_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "MyMM-App-Events",
+                _MYMM_EVENTS_REFERENCE_URL,
+                added,
+            )
+
+        if updated:
+            send_updated_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "MyMM-App-Events",
+                _MYMM_EVENTS_REFERENCE_URL,
+                updated,
+            )
+
+        if removed:
+            send_removed_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "MyMM-App-Events",
+                _MYMM_EVENTS_REFERENCE_URL,
+                removed,
+            )
+    else:
+        print("[app] No Discord webhook configured - skipping notifications")
+
+    _save_snapshot_ascii("mymm_app_events", current_data)
     return True
 
 
@@ -2726,6 +2998,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"âŒ Error tracking Site1 inventory API: {e}")
+
+    # Track public event list shown in the MyMM mobile app
+    try:
+        if track_mymm_app_events():
+            changes_detected = True
+    except Exception as e:
+        print(f"[app] Error tracking MyMM app events: {e}")
 
     # Track YouTube channel for new videos
     try:
