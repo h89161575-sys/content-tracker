@@ -1215,6 +1215,85 @@ def compare_items(
     return added, updated, removed
 
 
+def _humanize_change_field_name(field_name: str) -> str:
+    if not field_name:
+        return "Change"
+    text = field_name.replace("_", " ")
+    text = re.sub(r"(?<!^)([A-Z])", r" \1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:1].upper() + text[1:] if text else "Change"
+
+
+def _format_change_value_for_notification(value: Any, max_length: int = 120) -> str:
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if value is None:
+        return "None"
+    if isinstance(value, (dict, list)):
+        text = json.dumps(normalize_data(value), ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
+def build_grouped_item_updates(
+    old_items: Dict[str, Any],
+    new_items: Dict[str, Any],
+    updates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Group field-level updates by item and attach a readable item label."""
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for update in updates:
+        item_id = str(update.get("id") or "Unknown")
+        current_item = new_items.get(item_id) or old_items.get(item_id) or {}
+        display_name = ""
+        if isinstance(current_item, dict):
+            display_name = str(
+                current_item.get("title")
+                or current_item.get("name")
+                or current_item.get("slug")
+                or ""
+            ).strip()
+
+        if not display_name:
+            display_name = item_id
+
+        entry = grouped.setdefault(
+            item_id,
+            {
+                "id": item_id,
+                "display_name": display_name,
+                "changes": [],
+            },
+        )
+
+        field_label = _humanize_change_field_name(str(update.get("field") or "Change"))
+        old_value = _format_change_value_for_notification(update.get("old"))
+        new_value = _format_change_value_for_notification(update.get("new"))
+        entry["changes"].append(f"{field_label}: `{old_value}` -> `{new_value}`")
+
+    grouped_updates: List[Dict[str, Any]] = []
+    for item_id, entry in grouped.items():
+        details_lines: List[str] = []
+        if entry["display_name"] != item_id:
+            details_lines.append(f"ID: `{item_id}`")
+        details_lines.extend(entry["changes"])
+        grouped_updates.append(
+            {
+                "id": item_id,
+                "type": f"📝 Updated: {entry['display_name']}",
+                "details": "\n".join(details_lines),
+            }
+        )
+
+    grouped_updates.sort(key=lambda item: str(item.get("type") or ""))
+    return grouped_updates
+
+
 def compute_hash(data: Any) -> str:
     """Compute a hash of normalized data for quick comparison."""
     normalized = normalize_data(data)
@@ -1288,6 +1367,7 @@ def track_page(page: PageConfig) -> bool:
     new_items = get_items_by_id(page_data)
     
     added, updated, removed = compare_items(old_items, new_items)
+    grouped_updates = build_grouped_item_updates(old_items, new_items, updated)
     
     # Send notifications
     if DISCORD_WEBHOOK_URL:
@@ -1304,7 +1384,7 @@ def track_page(page: PageConfig) -> bool:
                 DISCORD_WEBHOOK_URL,
                 page.name,
                 page.url,
-                updated
+                grouped_updates
             )
         
         if removed:
@@ -1364,6 +1444,7 @@ def track_site1_inventory_api() -> bool:
     old_items = get_items_by_id(old_products)
     new_items = get_items_by_id(current_products)
     added, updated, removed = compare_items(old_items, new_items)
+    grouped_updates = build_grouped_item_updates(old_items, new_items, updated)
 
     print(
         f"ðŸ”„ Inventory API changes detected: +{len(added)} "
@@ -1384,7 +1465,7 @@ def track_site1_inventory_api() -> bool:
                 DISCORD_WEBHOOK_URL,
                 "Site1-Inventory-API",
                 _SITE1_SHOP_URL,
-                updated,
+                grouped_updates,
             )
 
         if removed:
@@ -1429,6 +1510,7 @@ def track_mymm_app_events() -> bool:
     old_items = get_items_by_id(old_events)
     new_items = get_items_by_id(current_events)
     added, updated, removed = compare_items(old_items, new_items)
+    grouped_updates = build_grouped_item_updates(old_items, new_items, updated)
 
     print(
         f"[app] MyMM app event changes detected: +{len(added)} "
@@ -1449,7 +1531,7 @@ def track_mymm_app_events() -> bool:
                 DISCORD_WEBHOOK_URL,
                 "MyMM-App-Events",
                 _MYMM_EVENTS_REFERENCE_URL,
-                updated,
+                grouped_updates,
             )
 
         if removed:
