@@ -196,6 +196,8 @@ IGNORE_KEYS = [
     "sessionId",
     "sessionToken",
     "requestId",
+    # Notification-only preview fields
+    "contentPreview",
 ]
 
 # Keys that contain timestamps or session data (normalize these)

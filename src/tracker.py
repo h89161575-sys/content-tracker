@@ -665,6 +665,13 @@ def _project_site1_inventory_variant(variant: Any) -> Optional[Dict[str, Any]]:
     return normalize_data(projected)
 
 
+def _build_site1_product_page_url(title_value: Any) -> str:
+    title = str(title_value or "").strip()
+    if not title:
+        return _SITE1_SHOP_URL
+    return "https://drjoedispenza.com/product-details/" + urllib.parse.quote(title, safe="")
+
+
 def _project_site1_inventory_product(product: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(product, dict):
         return None
@@ -678,6 +685,8 @@ def _project_site1_inventory_product(product: Any) -> Optional[Dict[str, Any]]:
     if isinstance(product_details, dict):
         short_description = str(product_details.get("shortDescription") or "").strip()
 
+    content_preview = _build_site1_product_preview_text(product)
+
     variants: List[Dict[str, Any]] = []
     raw_variants = product.get("variants")
     if isinstance(raw_variants, list):
@@ -687,7 +696,8 @@ def _project_site1_inventory_product(product: Any) -> Optional[Dict[str, Any]]:
                 variants.append(projected_variant)
         variants.sort(key=lambda item: str(item.get("variantId") or ""))
 
-    projected = {
+    projected = normalize_data(
+        {
         "_id": product_id,
         "title": product.get("title"),
         "status": product.get("status"),
@@ -703,8 +713,12 @@ def _project_site1_inventory_product(product: Any) -> Optional[Dict[str, Any]]:
         "images": product.get("images"),
         "originalPublishedDate": product.get("originalPublishedDate"),
         "shortDescription": short_description,
-    }
-    return normalize_data(projected)
+        "url": _build_site1_product_page_url(product.get("title")),
+        }
+    )
+    if content_preview:
+        projected["contentPreview"] = content_preview
+    return projected
 
 
 def _fetch_site1_inventory_snapshot_data() -> Optional[Dict[str, Any]]:
@@ -989,6 +1003,11 @@ def _fetch_site1_product_preview_from_api(route: str) -> Optional[Dict[str, str]
         "title": title,
         "text": preview_text,
     }
+
+
+def _extract_site1_product_detail_routes_from_html(html: str) -> List[str]:
+    routes = set(re.findall(r"/product-details/[^\"'#?<> ]+", html or ""))
+    return sorted(routes)
 
 
 # Site7 help center: filter out dynamic meta/related blocks to avoid noise.
@@ -1432,7 +1451,7 @@ def track_site1_inventory_api() -> bool:
     old_data = old_snapshot.get("data", {})
     old_products = old_data.get("products", []) if isinstance(old_data, dict) else []
 
-    if compute_hash(old_products) == compute_hash(current_products):
+    if compute_hash(normalize_data(old_products)) == compute_hash(normalize_data(current_products)):
         print("âœ… No inventory API changes")
         if (
             old_data.get("productIds") != current_data.get("productIds")
@@ -1479,6 +1498,98 @@ def track_site1_inventory_api() -> bool:
         print("âš ï¸  No Discord webhook configured - skipping notifications")
 
     save_snapshot("site1_inventory_api", current_data)
+    return True
+
+
+def track_site1_homepage_product_details() -> bool:
+    """
+    Track product-detail routes linked directly from the Site1 homepage.
+
+    This covers homepage-featured products/resources that may not appear in the
+    shop inventory collection feed but are still live and reachable.
+    """
+    print("\n[site1] Tracking: Homepage Product Detail Routes")
+
+    html = fetch_page("https://drjoedispenza.com/")
+    if not html:
+        print("[site1] Could not fetch homepage for product-detail discovery")
+        return False
+
+    routes = _extract_site1_product_detail_routes_from_html(html)
+    print(f"[site1] Found {len(routes)} homepage product-detail route(s)")
+
+    current_items: List[Dict[str, Any]] = []
+    for route in routes:
+        route_info = _fetch_route_content("https://drjoedispenza.com", route)
+        title = str(route_info.get("title") or "").strip()
+        if not title:
+            title = urllib.parse.unquote(route.split("/product-details/", 1)[-1]).strip()
+
+        current_items.append(
+            {
+                "_id": route,
+                "title": title,
+                "url": route_info.get("full_url") or ("https://drjoedispenza.com" + route),
+                "status": route_info.get("status"),
+                "contentPreview": str(route_info.get("content_preview") or "").strip(),
+            }
+        )
+
+    current_items.sort(key=lambda item: str(item.get("_id") or ""))
+    current_data = {
+        "items": current_items,
+        "count": len(current_items),
+    }
+
+    old_snapshot = load_snapshot("site1_homepage_product_details")
+    if old_snapshot is None:
+        print(f"[site1] First homepage product-detail snapshot ({len(current_items)} routes)")
+        _save_snapshot_ascii("site1_homepage_product_details", current_data)
+        return False
+
+    old_data = old_snapshot.get("data", {})
+    old_items_list = old_data.get("items", []) if isinstance(old_data, dict) else []
+
+    if compute_hash(normalize_data(old_items_list)) == compute_hash(normalize_data(current_items)):
+        print("[site1] No homepage product-detail route changes")
+        return False
+
+    old_items = get_items_by_id(old_items_list)
+    new_items = get_items_by_id(current_items)
+    added, updated, removed = compare_items(old_items, new_items)
+    grouped_updates = build_grouped_item_updates(old_items, new_items, updated)
+
+    print(
+        f"[site1] Homepage product-detail changes detected: +{len(added)} "
+        f"~{len(grouped_updates)} -{len(removed)}"
+    )
+
+    if DISCORD_WEBHOOK_URL:
+        if added:
+            send_new_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Homepage-Product-Details",
+                "https://drjoedispenza.com/",
+                added,
+            )
+        if grouped_updates:
+            send_updated_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Homepage-Product-Details",
+                "https://drjoedispenza.com/",
+                grouped_updates,
+            )
+        if removed:
+            send_removed_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Homepage-Product-Details",
+                "https://drjoedispenza.com/",
+                removed,
+            )
+    else:
+        print("[site1] No Discord webhook configured - skipping notifications")
+
+    _save_snapshot_ascii("site1_homepage_product_details", current_data)
     return True
 
 
@@ -3080,6 +3191,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"âŒ Error tracking Site1 inventory API: {e}")
+
+    # Track homepage-linked Site1 product-detail routes (covers non-inventory products/resources)
+    try:
+        if track_site1_homepage_product_details():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking homepage product-detail routes: {e}")
 
     # Track public event list shown in the MyMM mobile app
     try:

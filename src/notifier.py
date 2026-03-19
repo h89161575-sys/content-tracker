@@ -143,16 +143,29 @@ def send_new_items_notification(
         title = item.get("title") or item.get("name") or item.get("_id") or item.get("url") or "Unknown"
         status = item.get("status", "")
         start_date = item.get("startDate", "")
-        
-        details = f"**{title}**"
+        item_url = item.get("url") or item.get("full_url") or ""
+        content_preview = (
+            item.get("contentPreview")
+            or item.get("content_preview")
+            or item.get("text")
+            or ""
+        )
+
+        details_lines = [f"**{title}**"]
         if status:
-            details += f"\nStatus: `{status}`"
+            details_lines.append(f"Status: `{status}`")
         if start_date:
-            details += f"\nStart: `{start_date[:10]}`"
+            details_lines.append(f"Start: `{start_date[:10]}`")
+        if item_url:
+            details_lines.append(f"URL: {item_url}")
+        if content_preview:
+            details_lines.append("")
+            details_lines.append("Preview:")
+            details_lines.append(_truncate(str(content_preview).strip(), 650))
             
         changes.append({
             "type": "🆕 New Item",
-            "details": details
+            "details": "\n".join(details_lines)
         })
     
     return send_discord_notification(
@@ -567,16 +580,29 @@ def send_new_items_notification(
         title = item.get("title") or item.get("name") or item.get("_id") or item.get("url") or "Unknown"
         status = item.get("status", "")
         start_date = item.get("startDate", "")
-        
-        details = f"**{title}**"
+        item_url = item.get("url") or item.get("full_url") or ""
+        content_preview = (
+            item.get("contentPreview")
+            or item.get("content_preview")
+            or item.get("text")
+            or ""
+        )
+
+        details_lines = [f"**{title}**"]
         if status:
-            details += f"\nStatus: `{status}`"
+            details_lines.append(f"Status: `{status}`")
         if start_date:
-            details += f"\nStart: `{start_date[:10]}`"
+            details_lines.append(f"Start: `{start_date[:10]}`")
+        if item_url:
+            details_lines.append(f"URL: {item_url}")
+        if content_preview:
+            details_lines.append("")
+            details_lines.append("Preview:")
+            details_lines.append(_truncate(str(content_preview).strip(), 650))
             
         changes.append({
             "type": "🆕 New Item",
-            "details": details
+            "details": "\n".join(details_lines)
         })
     
     return send_discord_notification(
