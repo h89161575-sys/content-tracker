@@ -456,8 +456,35 @@ def _extract_title_from_html(html: str) -> str:
     if not match:
         return ""
     title = unescape(match.group(1))
+    title = _repair_common_utf8_mojibake(title)
     title = re.sub(r"\s+", " ", title).strip()
     return title
+
+
+def _repair_common_utf8_mojibake(text: str) -> str:
+    """Repair common UTF-8 mojibake that leaks through mislabelled HTML responses."""
+    if not text:
+        return text
+
+    markers = ("â€™", "â€œ", "â€", "â€“", "â€”", "â€¦", "Ã", "Â")
+    marker_hits = sum(text.count(marker) for marker in markers)
+    if marker_hits == 0:
+        return text
+
+    best_text = text
+    best_hits = marker_hits
+    for source_encoding in ("cp1252", "latin-1"):
+        try:
+            repaired = text.encode(source_encoding).decode("utf-8")
+        except Exception:
+            continue
+
+        repaired_hits = sum(repaired.count(marker) for marker in markers)
+        if repaired_hits < best_hits:
+            best_text = repaired
+            best_hits = repaired_hits
+
+    return best_text
 
 
 def _extract_clean_body_html(html: str) -> str:
@@ -488,7 +515,7 @@ def _extract_text_from_body_html(
         # HTML can be malformed; return best-effort text.
         pass
 
-    raw = unescape(extractor.get_text())
+    raw = _repair_common_utf8_mojibake(unescape(extractor.get_text()))
 
     # Normalize whitespace while keeping some line structure.
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
@@ -532,6 +559,19 @@ def _extract_route_preview_text_from_html(html: str) -> str:
         return shell_reduced_text
 
     return _extract_text_from_body_html(clean_body)
+
+
+def _build_html_tracking_snapshot_data(html: str) -> Dict[str, Any]:
+    """Build a text-based snapshot for plain HTML pages."""
+    clean_body_html = _extract_clean_body_html(html)
+    extracted_text = _extract_text_from_body_html(clean_body_html)
+    return {
+        "_trackingMode": "html_text",
+        "title": _extract_title_from_html(html),
+        "textHash": hashlib.md5(extracted_text.encode()).hexdigest(),
+        "text": extracted_text,
+        "contentPreview": extracted_text[:1500] if extracted_text else "",
+    }
 
 
 # Site1 product-detail pages (drjoedispenza.com) load product text client-side via
@@ -2467,8 +2507,41 @@ def build_grouped_item_updates(
     return grouped_updates
 
 
-def _build_generic_page_update(page_name: str, old_data: Any, new_data: Any) -> List[Dict[str, Any]]:
+def _build_generic_page_update(page_name: str, page_url: str, old_data: Any, new_data: Any) -> List[Dict[str, Any]]:
     """Create a fallback update when data changed but no item-level IDs were found."""
+    if (
+        isinstance(old_data, dict)
+        and isinstance(new_data, dict)
+        and new_data.get("_trackingMode") == "html_text"
+    ):
+        title = str(new_data.get("title") or old_data.get("title") or page_name).strip()
+        old_text = str(old_data.get("text") or "").strip()
+        new_text = str(new_data.get("text") or "").strip()
+        details_lines = [f"**{title}**", f"URL: {page_url}"]
+
+        if old_text and new_text:
+            diff_summary = _summarize_text_diff(old_text, new_text, context_lines=0)
+            if diff_summary:
+                details_lines.append("Diff (rot = entfernt, grün = neu):")
+                details_lines.append(diff_summary)
+            else:
+                old_preview = str(old_data.get("contentPreview") or "").strip()
+                new_preview = str(new_data.get("contentPreview") or "").strip()
+                if old_preview != new_preview:
+                    details_lines.append("Preview:")
+                    details_lines.append(_truncate(new_preview or "(kein Text)", 650))
+                else:
+                    details_lines.append("Hinweis: HTML-Seite geändert, aber kein stabiler Text-Diff erkennbar.")
+        else:
+            details_lines.append("Hinweis: Text-Baseline wurde neu erstellt; Diff ist ab dem nächsten Lauf verfügbar.")
+
+        return [{
+            "id": page_name,
+            "field": "content",
+            "type": _truncate_for_discord_field_name(f"📝 Content: {title}" if title else "📝 Content geändert"),
+            "details": "\n".join(details_lines),
+        }]
+
     details_lines = ["Structured page data changed."]
 
     if isinstance(old_data, dict) and isinstance(new_data, dict):
@@ -2593,16 +2666,9 @@ def track_page(page: PageConfig) -> bool:
         if page.url.startswith(_SITE2_BASE_URL):
             page_data = _sanitize_site2_page_data_for_tracking(page_data)
     else:
-        # No Next.js data - use HTML content hash for tracking
+        # No Next.js data - extract readable page text instead of hashing raw HTML.
         print(f"ℹ️  No __NEXT_DATA__ on {page.name} - using HTML tracking")
-        # Extract just the body content to reduce noise from headers/scripts
-        import re as regex
-        body_match = regex.search(r'<body[^>]*>(.*?)</body>', html, regex.DOTALL | regex.IGNORECASE)
-        body_content = body_match.group(1) if body_match else html
-        # Remove scripts and styles to focus on content
-        body_content = regex.sub(r'<script[^>]*>.*?</script>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
-        body_content = regex.sub(r'<style[^>]*>.*?</style>', '', body_content, flags=regex.DOTALL | regex.IGNORECASE)
-        page_data = {"_html_hash": hashlib.md5(body_content.encode()).hexdigest(), "_content_length": len(body_content)}
+        page_data = _build_html_tracking_snapshot_data(html)
     
     # Load previous snapshot
     old_snapshot = load_snapshot(page.name)
@@ -2614,6 +2680,19 @@ def track_page(page: PageConfig) -> bool:
         return False
     
     old_data = old_snapshot.get("data", {})
+
+    if (
+        isinstance(old_data, dict)
+        and old_data.get("_html_hash")
+        and isinstance(page_data, dict)
+        and page_data.get("_trackingMode") == "html_text"
+    ):
+        print(
+            f"[html] Updating snapshot baseline for {page.name} "
+            "to text-based HTML tracking; skipping notifications this run"
+        )
+        save_snapshot(page.name, page_data)
+        return False
 
     if page.url.startswith(_SITE2_BASE_URL) and isinstance(old_data, dict):
         old_initial_data = old_data.get("initialData", {})
@@ -2652,7 +2731,7 @@ def track_page(page: PageConfig) -> bool:
     grouped_updates = build_grouped_item_updates(old_items, new_items, updated)
     fallback_updates: List[Dict[str, Any]] = []
     if not added and not updated and not removed:
-        fallback_updates = _build_generic_page_update(page.name, old_data, page_data)
+        fallback_updates = _build_generic_page_update(page.name, page.url, old_data, page_data)
     
     # Send notifications
     if DISCORD_WEBHOOK_URL:
