@@ -1,6 +1,7 @@
 # Main Tracker Script for Website Change Monitoring
 
 import difflib
+import copy
 import gzip
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import hashlib
 import secrets
 import zlib
+from collections import Counter
 from datetime import datetime, timezone
 from html import escape, unescape
 from html.parser import HTMLParser
@@ -541,6 +543,19 @@ _SITE1_REALM_BASE_URLS = [
 _SITE1_APP_RUNNER_BASE_URL = "https://8jmuszggp2.us-east-1.awsapprunner.com/api/v1"
 _SITE1_SHOP_URL = "https://drjoedispenza.com/shop/categories?shopSection=All%20Products"
 _SITE1_SHOP_COLLECTION_STATUSES = ["Active", "Coming Soon"]
+_SITE1_PUBLIC_POLICY_IDS = [
+    {
+        "_id": "6386285ce0a78f695e6ac6d1",
+        "reference_url": "https://drjoedispenza.com/shipping-and-returns-policy",
+    }
+]
+_SITE2_BASE_URL = "https://drjoedispenza.info/s/Drjoedispenza"
+_SITE2_DISCOVERY_URLS = [
+    _SITE2_BASE_URL,
+    f"{_SITE2_BASE_URL}/produkte",
+    f"{_SITE2_BASE_URL}/dispenza-onlinekurse",
+    f"{_SITE2_BASE_URL}/blog",
+]
 _MYMM_REALM_BASE_URL = "https://us-east-1.aws.realm.mongodb.com/api/client/v2.0/app/production-lzmdf"
 _MYMM_EVENTS_REFERENCE_URL = "https://events.drjoedispenza.com/"
 _MYMM_APP_LOGIN_PAYLOAD = {
@@ -581,6 +596,7 @@ def _call_site1_realm_function(function_name: str, arguments: List[Any]) -> Opti
             payload = {
                 "name": function_name,
                 "arguments": arguments,
+                "service": "mainCluster",
             }
             call_req = urllib.request.Request(
                 f"{base_url}/functions/call",
@@ -621,6 +637,24 @@ def _extract_object_id(value: Any) -> Optional[str]:
 
 
 def _fetch_site1_collection_product_ids() -> Optional[Tuple[List[str], List[str]]]:
+    public_catalog = _fetch_site1_public_catalog_snapshot_data()
+    if public_catalog:
+        product_ids = set()
+        collection_names = set()
+        for item in public_catalog.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            product_id = str(item.get("_id") or "").strip()
+            if product_id:
+                product_ids.add(product_id)
+            for category in item.get("categories", []) or []:
+                category_name = str(category or "").strip()
+                if category_name:
+                    collection_names.add(category_name)
+
+        if product_ids:
+            return sorted(product_ids), sorted(collection_names)
+
     collections_payload = _call_site1_realm_function(
         "fetchProductCollections",
         [1, 200, None, "", _SITE1_SHOP_COLLECTION_STATUSES, []],
@@ -730,10 +764,13 @@ def _fetch_site1_inventory_snapshot_data() -> Optional[Dict[str, Any]]:
     if not product_ids:
         return None
 
-    response = fetch_json(
-        f"{_SITE1_APP_RUNNER_BASE_URL}/products/inventory/snapshot",
-        method="POST",
-        payload={"productIds": product_ids},
+    response = _post_site1_app_runner_json(
+        "users/record",
+        {
+            "collectionName": "products",
+            "query": {},
+            "isPublic": True,
+        },
     )
     if not isinstance(response, dict):
         return None
@@ -742,8 +779,14 @@ def _fetch_site1_inventory_snapshot_data() -> Optional[Dict[str, Any]]:
     if not isinstance(response_data, list):
         return None
 
+    visible_product_ids = set(product_ids)
     products: List[Dict[str, Any]] = []
     for raw_product in response_data:
+        if not isinstance(raw_product, dict):
+            continue
+        product_id = _extract_object_id(raw_product.get("_id"))
+        if not product_id or product_id not in visible_product_ids:
+            continue
         projected_product = _project_site1_inventory_product(raw_product)
         if projected_product:
             products.append(projected_product)
@@ -755,6 +798,772 @@ def _fetch_site1_inventory_snapshot_data() -> Optional[Dict[str, Any]]:
         "productIds": product_ids,
         "collectionNames": collection_names,
         "count": len(products),
+    }
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    if isinstance(value, dict):
+        for key in ("$numberInt", "$numberLong"):
+            raw_value = value.get(key)
+            if isinstance(raw_value, str) and raw_value.strip().lstrip("-").isdigit():
+                return int(raw_value.strip())
+    return None
+
+
+def _build_site1_community_group_url(title_value: Any) -> str:
+    title = str(title_value or "").strip()
+    if not title:
+        return "https://drjoedispenza.com/community"
+    return "https://drjoedispenza.com/community-group/" + urllib.parse.quote(title, safe="")
+
+
+def _post_site1_app_runner_json(path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    response = fetch_json(
+        f"{_SITE1_APP_RUNNER_BASE_URL}/{path.lstrip('/')}",
+        method="POST",
+        payload=payload,
+    )
+    if not isinstance(response, dict):
+        return None
+    return response
+
+
+def _get_site1_app_runner_json(path: str) -> Optional[Dict[str, Any]]:
+    response = fetch_json(f"{_SITE1_APP_RUNNER_BASE_URL}/{path.lstrip('/')}")
+    if not isinstance(response, dict):
+        return None
+    return response
+
+
+def _load_site1_inventory_item_ids() -> set[str]:
+    inventory_ids: set[str] = set()
+    old_snapshot = load_snapshot("site1_inventory_api")
+    old_data = old_snapshot.get("data", {}) if old_snapshot else {}
+    old_products = old_data.get("products", []) if isinstance(old_data, dict) else []
+
+    for product in old_products:
+        if not isinstance(product, dict):
+            continue
+        product_id = str(product.get("_id") or "").strip()
+        if product_id:
+            inventory_ids.add(product_id)
+
+    if inventory_ids:
+        return inventory_ids
+
+    current_inventory = _fetch_site1_inventory_snapshot_data()
+    if not current_inventory:
+        return inventory_ids
+
+    for product in current_inventory.get("products", []):
+        if not isinstance(product, dict):
+            continue
+        product_id = str(product.get("_id") or "").strip()
+        if product_id:
+            inventory_ids.add(product_id)
+
+    return inventory_ids
+
+
+def _project_site1_public_catalog_product(product: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(product, dict):
+        return None
+
+    product_id = _extract_object_id(product.get("_id"))
+    if not product_id:
+        return None
+
+    variants: List[Dict[str, Any]] = []
+    raw_variants = product.get("variants")
+    if isinstance(raw_variants, list):
+        for raw_variant in raw_variants:
+            projected_variant = _project_site1_inventory_variant(raw_variant)
+            if projected_variant:
+                variants.append(projected_variant)
+        variants.sort(key=lambda item: str(item.get("variantId") or ""))
+
+    projected = {
+        "_id": product_id,
+        "title": str(product.get("title") or "").strip(),
+        "status": product.get("status"),
+        "type": product.get("type"),
+        "categories": sorted(str(value) for value in (product.get("categories") or []) if str(value).strip()),
+        "pricing": product.get("pricing"),
+        "variants": variants,
+        "restrictions": product.get("restrictions"),
+        "images": product.get("images"),
+        "score": product.get("score"),
+        "url": _build_site1_product_page_url(product.get("title")),
+    }
+    return normalize_data(projected)
+
+
+def _fetch_site1_public_catalog_snapshot_data() -> Optional[Dict[str, Any]]:
+    products: List[Dict[str, Any]] = []
+    page = 1
+    page_size = 50
+    total_count = 0
+
+    while True:
+        response = _post_site1_app_runner_json(
+            "products/fetchProducts",
+            {
+                "shopByType": "categories",
+                "shopSection": "all products",
+                "page": page,
+                "paginationSize": page_size,
+                "sort": {"originalPublishedDate": -1},
+                "filters": [],
+                "searchTerm": "",
+                "status": ["Active", "Coming Soon"],
+            },
+        )
+        if not response:
+            break
+
+        response_data = response.get("data")
+        if not isinstance(response_data, list) or not response_data or not isinstance(response_data[0], dict):
+            break
+
+        first_block = response_data[0]
+        metadata = first_block.get("metadata")
+        if isinstance(metadata, list) and metadata and isinstance(metadata[0], dict):
+            total_count = _coerce_int(metadata[0].get("total")) or total_count
+
+        page_items = first_block.get("data")
+        if not isinstance(page_items, list) or not page_items:
+            break
+
+        for raw_product in page_items:
+            projected_product = _project_site1_public_catalog_product(raw_product)
+            if projected_product:
+                products.append(projected_product)
+
+        if total_count and len(products) >= total_count:
+            break
+        if len(page_items) < page_size:
+            break
+        page += 1
+
+    if not products:
+        return None
+
+    product_map = {str(item.get("_id") or ""): item for item in products if str(item.get("_id") or "").strip()}
+    ordered_products = sorted(product_map.values(), key=lambda item: str(item.get("_id") or ""))
+
+    return {
+        "items": ordered_products,
+        "count": len(ordered_products),
+        "typeCounts": dict(sorted(Counter(str(item.get("type") or "") for item in ordered_products).items())),
+    }
+
+
+def _project_site1_public_category(category: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(category, dict):
+        return None
+
+    category_id = _extract_object_id(category.get("_id"))
+    if not category_id:
+        return None
+
+    return normalize_data(
+        {
+            "_id": category_id,
+            "title": str(category.get("title") or "").strip(),
+            "status": category.get("status"),
+            "editable": category.get("editable"),
+            "descriptionPreview": str(category.get("description") or "").strip(),
+            "url": _SITE1_SHOP_URL,
+        }
+    )
+
+
+def _fetch_site1_public_categories_snapshot_data() -> Optional[Dict[str, Any]]:
+    response = _post_site1_app_runner_json(
+        "users/record",
+        {
+            "collectionName": "categories",
+            "query": {"status": "Active"},
+            "isPublic": True,
+        },
+    )
+    if not response:
+        return None
+
+    response_data = response.get("data")
+    if not isinstance(response_data, list):
+        return None
+
+    items: List[Dict[str, Any]] = []
+    for raw_category in response_data:
+        projected_category = _project_site1_public_category(raw_category)
+        if projected_category:
+            items.append(projected_category)
+
+    items.sort(key=lambda item: str(item.get("title") or ""))
+    return {
+        "items": items,
+        "count": len(items),
+    }
+
+
+def _project_site1_subscription(subscription: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(subscription, dict):
+        return None
+
+    subscription_id = _extract_object_id(subscription.get("_id"))
+    if not subscription_id:
+        return None
+
+    recommended_products = subscription.get("recommendedProducts")
+    recommended_product_ids: List[str] = []
+    if isinstance(recommended_products, list):
+        for product_ref in recommended_products:
+            if isinstance(product_ref, dict):
+                product_id = _extract_object_id(product_ref.get("objId") or product_ref.get("_id") or product_ref.get("id"))
+                if product_id:
+                    recommended_product_ids.append(product_id)
+
+    return normalize_data(
+        {
+            "_id": subscription_id,
+            "title": str(subscription.get("title") or "").strip(),
+            "status": subscription.get("status"),
+            "type": subscription.get("type"),
+            "shortDescription": str(subscription.get("shortDescription") or "").strip(),
+            "annual": subscription.get("annual"),
+            "monthly": subscription.get("monthly"),
+            "options": subscription.get("options"),
+            "categories": subscription.get("categories"),
+            "variants": subscription.get("variants"),
+            "samples": subscription.get("samples"),
+            "availableOnUnlimited": subscription.get("availableOnUnlimited"),
+            "recommendedProductIds": sorted(set(recommended_product_ids)),
+            "url": "https://drjoedispenza.com/dr-joe-live",
+        }
+    )
+
+
+def _fetch_site1_subscriptions_snapshot_data() -> Optional[Dict[str, Any]]:
+    response = _post_site1_app_runner_json(
+        "collection/find-record",
+        {
+            "collection": "subscriptions",
+            "query": {"type": "drJoeLive"},
+        },
+    )
+    if not response:
+        return None
+
+    projected_subscription = _project_site1_subscription(response.get("data"))
+    if not projected_subscription:
+        return None
+
+    return {
+        "items": [projected_subscription],
+        "count": 1,
+    }
+
+
+def _project_site1_policy(policy: Any, *, reference_url: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(policy, dict):
+        return None
+
+    policy_id = _extract_object_id(policy.get("_id"))
+    if not policy_id:
+        return None
+
+    sections = policy.get("sections")
+    normalized_sections: List[Dict[str, Any]] = []
+    content_fragments: List[str] = []
+    if isinstance(sections, list):
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            title = str(section.get("title") or "").strip()
+            content_html = section.get("content")
+            if isinstance(content_html, str) and content_html.strip():
+                content_fragments.append(content_html)
+            normalized_sections.append(
+                {
+                    "title": title,
+                    "contentPreview": _extract_text_preview_from_html_fragment(content_html),
+                }
+            )
+
+    return normalize_data(
+        {
+            "_id": policy_id,
+            "title": str(policy.get("title") or "").strip(),
+            "sections": normalized_sections,
+            "contentPreview": _extract_text_preview_from_html_fragment("".join(content_fragments)),
+            "url": reference_url,
+        }
+    )
+
+
+def _fetch_site1_policies_snapshot_data() -> Optional[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for policy_info in _SITE1_PUBLIC_POLICY_IDS:
+        response = _post_site1_app_runner_json(
+            "collection/find-record",
+            {
+                "collection": "policiesAndDisclaimers",
+                "query": {"_id": policy_info["_id"]},
+            },
+        )
+        if not response:
+            continue
+        projected_policy = _project_site1_policy(
+            response.get("data"),
+            reference_url=policy_info["reference_url"],
+        )
+        if projected_policy:
+            items.append(projected_policy)
+
+    if not items:
+        return None
+
+    items.sort(key=lambda item: str(item.get("title") or ""))
+    return {
+        "items": items,
+        "count": len(items),
+    }
+
+
+def _project_site1_community_group(group: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(group, dict):
+        return None
+
+    group_id = _extract_object_id(group.get("_id"))
+    if not group_id:
+        return None
+
+    next_conversation = group.get("nextConversation") if isinstance(group.get("nextConversation"), dict) else {}
+    previous_conversation = (
+        group.get("previousConversation") if isinstance(group.get("previousConversation"), dict) else {}
+    )
+    personalized_message = (
+        group.get("personalizedMessage") if isinstance(group.get("personalizedMessage"), dict) else {}
+    )
+    title = str(group.get("title") or "").strip()
+
+    return normalize_data(
+        {
+            "_id": group_id,
+            "title": title,
+            "status": group.get("status"),
+            "restriction": group.get("restriction"),
+            "locked": group.get("locked"),
+            "reason": str(group.get("reason") or "").strip(),
+            "descriptionPreview": str(group.get("description") or "").strip(),
+            "image": group.get("image"),
+            "bannerImage": group.get("bannerImage"),
+            "nextConversationDate": str(next_conversation.get("conversationDate") or "").strip(),
+            "nextConversationTime": str(next_conversation.get("time") or "").strip(),
+            "nextConversationTimeZone": str(next_conversation.get("timeZone") or "").strip(),
+            "nextConversationIsTbd": next_conversation.get("isTbd"),
+            "nextConversationBrightCoveId": str(next_conversation.get("brightCoveId") or "").strip(),
+            "previousConversationDate": str(previous_conversation.get("conversationDate") or "").strip(),
+            "previousConversationBrightCoveId": str(previous_conversation.get("brightCoveId") or "").strip(),
+            "personalizedMessageTitle": str(personalized_message.get("title") or "").strip(),
+            "personalizedMessageUpdatedAt": str(personalized_message.get("lastModified") or "").strip(),
+            "url": _build_site1_community_group_url(title),
+        }
+    )
+
+
+def _fetch_site1_community_groups_snapshot_data() -> Optional[Dict[str, Any]]:
+    response = _post_site1_app_runner_json(
+        "users/record",
+        {
+            "collectionName": "communityGroups",
+            "query": {},
+            "isPublic": True,
+        },
+    )
+    if not response:
+        return None
+
+    response_data = response.get("data")
+    if not isinstance(response_data, list):
+        return None
+
+    items: List[Dict[str, Any]] = []
+    for raw_group in response_data:
+        projected_group = _project_site1_community_group(raw_group)
+        if projected_group:
+            items.append(projected_group)
+
+    items.sort(key=lambda item: str(item.get("title") or ""))
+    return {
+        "items": items,
+        "count": len(items),
+    }
+
+
+def _fetch_site1_routing_config_snapshot_data() -> Optional[Dict[str, Any]]:
+    response = _get_site1_app_runner_json("routing-config")
+    if not response:
+        return None
+
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    function_overrides = data.get("functionOverrides")
+    if not isinstance(function_overrides, dict):
+        function_overrides = {}
+
+    user_overrides = data.get("userOverrides")
+    if not isinstance(user_overrides, dict):
+        user_overrides = {}
+
+    user_fallback_counts: Counter[str] = Counter()
+    for override in user_overrides.values():
+        if not isinstance(override, dict):
+            continue
+        fallback_name = str(override.get("globalFallback") or "").strip() or "__unknown__"
+        user_fallback_counts[fallback_name] += 1
+
+    items: List[Dict[str, Any]] = [
+        normalize_data(
+            {
+                "_id": "__meta__",
+                "globalFallback": str(data.get("globalFallback") or "").strip(),
+                "fallbackToRealmOnNodeError": data.get("fallbackToRealmOnNodeError"),
+                "userOverrideCount": len(user_overrides),
+                "userOverrideFallbacks": dict(sorted(user_fallback_counts.items())),
+            }
+        )
+    ]
+
+    for function_name, target in sorted(function_overrides.items()):
+        items.append(
+            normalize_data(
+                {
+                    "_id": str(function_name),
+                    "target": str(target or "").strip(),
+                }
+            )
+        )
+
+    return {
+        "items": items,
+        "functionOverrideCount": len(function_overrides),
+        "userOverrideCount": len(user_overrides),
+    }
+
+
+def _project_site1_media_settings(settings_record: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(settings_record, dict):
+        return None
+
+    settings_id = _extract_object_id(settings_record.get("_id"))
+    if not settings_id:
+        return None
+
+    announcement = settings_record.get("announcementData") if isinstance(settings_record.get("announcementData"), dict) else {}
+
+    return normalize_data(
+        {
+            "_id": settings_id,
+            "type": str(settings_record.get("type") or "").strip(),
+            "domain": str(settings_record.get("domain") or "").strip(),
+            "title": str(announcement.get("title") or "").strip(),
+            "path": str(announcement.get("path") or "").strip(),
+            "height": _coerce_int(announcement.get("height")),
+            "mobileHeight": _coerce_int(announcement.get("mobileHeight")),
+            "color": str(announcement.get("color") or "").strip(),
+            "url": "https://drjoedispenza.com/",
+        }
+    )
+
+
+def _fetch_site1_media_settings_snapshot_data() -> Optional[Dict[str, Any]]:
+    settings_record = _call_site1_realm_function(
+        "findOne",
+        [
+            {
+                "database": "MainDB",
+                "collection": "settings",
+                "query": {"type": "media"},
+            }
+        ],
+    )
+    projected_settings = _project_site1_media_settings(settings_record)
+    if not projected_settings:
+        return None
+
+    return {
+        "items": [projected_settings],
+        "count": 1,
+    }
+
+
+def _project_site1_drjoe_live_record(record: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(record, dict):
+        return None
+
+    record_id = _extract_object_id(record.get("_id"))
+    if not record_id:
+        return None
+
+    conversation = record.get("conversationDate") if isinstance(record.get("conversationDate"), dict) else {}
+    return normalize_data(
+        {
+            "_id": record_id,
+            "title": str(record.get("title") or "").strip(),
+            "activeView": str(record.get("activeView") or "").strip(),
+            "conversationDate": _realm_epoch_ms_to_iso(conversation.get("fullDate")),
+            "conversationTime": str(conversation.get("time") or "").strip(),
+            "conversationTimeZone": str(conversation.get("timeZone") or "").strip(),
+            "image": record.get("image"),
+            "brightCoveId": str(record.get("brightCoveId") or "").strip(),
+            "url": f"https://drjoedispenza.com/dr-joe-live/{record_id}",
+        }
+    )
+
+
+def _fetch_site1_drjoe_live_snapshot_data() -> Optional[Dict[str, Any]]:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    records = _call_site1_realm_function(
+        "find",
+        [
+            {
+                "database": "MainDB",
+                "collection": "drJoeLive",
+                "query": {
+                    "conversationDate.fullDate": {"$gte": {"$date": {"$numberLong": str(now_ms)}}},
+                    "activeView": {"$in": ["upcoming", "live"]},
+                    "status": "Active",
+                },
+                "project": {
+                    "conversationDate": {"$numberInt": "1"},
+                    "title": {"$numberInt": "1"},
+                    "image": {"$numberInt": "1"},
+                    "activeView": {"$numberInt": "1"},
+                    "brightCoveId": {"$numberInt": "1"},
+                },
+                "sort": {"conversationDate.fullDate": {"$numberInt": "1"}},
+                "limit": {"$numberInt": "5"},
+            }
+        ],
+    )
+    if not isinstance(records, list):
+        return None
+
+    items: List[Dict[str, Any]] = []
+    for raw_record in records:
+        projected_record = _project_site1_drjoe_live_record(raw_record)
+        if projected_record:
+            items.append(projected_record)
+
+    items.sort(key=lambda item: (str(item.get("conversationDate") or ""), str(item.get("_id") or "")))
+    return {
+        "items": items,
+        "count": len(items),
+    }
+
+
+def _project_site1_event_preview_product(product: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(product, dict):
+        return None
+
+    product_id = _extract_object_id(product.get("_id"))
+    if not product_id:
+        return None
+
+    images = product.get("images")
+    if isinstance(images, list):
+        images = [value for value in images if isinstance(value, str) and value.strip()]
+
+    return normalize_data(
+        {
+            "_id": product_id,
+            "title": str(product.get("title") or "").strip(),
+            "status": product.get("status"),
+            "type": product.get("type"),
+            "eventType": str(product.get("eventType") or "").strip(),
+            "startDate": _realm_epoch_ms_to_iso(product.get("startDate")),
+            "endDate": _realm_epoch_ms_to_iso(product.get("endDate")),
+            "registrationStart": _realm_epoch_ms_to_iso(product.get("registrationStart")),
+            "availableOnUnlimited": product.get("availableOnUnlimited"),
+            "hideFromUpcoming": product.get("hideFromUpcoming"),
+            "images": images,
+            "url": _build_site1_product_page_url(product.get("title")),
+        }
+    )
+
+
+def _fetch_site1_event_preview_snapshot_data() -> Optional[Dict[str, Any]]:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    products = _call_site1_realm_function(
+        "find",
+        [
+            {
+                "database": "MainDB",
+                "collection": "products",
+                "query": {
+                    "status": {"$in": ["Active", "Coming Soon"]},
+                    "availableOnUnlimited": True,
+                    "type": "event",
+                    "startDate": {"$gte": {"$date": {"$numberLong": str(now_ms)}}},
+                    "hideFromUpcoming": {"$ne": True},
+                },
+                "project": {
+                    "title": {"$numberInt": "1"},
+                    "status": {"$numberInt": "1"},
+                    "type": {"$numberInt": "1"},
+                    "eventType": {"$numberInt": "1"},
+                    "startDate": {"$numberInt": "1"},
+                    "endDate": {"$numberInt": "1"},
+                    "registrationStart": {"$numberInt": "1"},
+                    "images": {"$numberInt": "1"},
+                    "availableOnUnlimited": {"$numberInt": "1"},
+                    "hideFromUpcoming": {"$numberInt": "1"},
+                },
+                "sort": {"startDate": {"$numberInt": "1"}},
+                "limit": {"$numberInt": "50"},
+            }
+        ],
+    )
+    if not isinstance(products, list):
+        return None
+
+    items: List[Dict[str, Any]] = []
+    for raw_product in products:
+        projected_product = _project_site1_event_preview_product(raw_product)
+        if projected_product:
+            items.append(projected_product)
+
+    items.sort(key=lambda item: (str(item.get("startDate") or ""), str(item.get("title") or "")))
+    return {
+        "items": items,
+        "count": len(items),
+    }
+
+
+def _fetch_site1_brightcove_refs_snapshot_data() -> Optional[Dict[str, Any]]:
+    refs_by_id: Dict[str, Dict[str, Any]] = {}
+
+    def add_ref(
+        video_id_value: Any,
+        *,
+        title: str,
+        source_tag: str,
+        owner_title: str,
+        url: str,
+    ) -> None:
+        video_id = str(video_id_value or "").strip()
+        if not video_id:
+            return
+
+        existing = refs_by_id.get(video_id)
+        if not existing:
+            existing = {
+                "_id": video_id,
+                "title": title.strip() or video_id,
+                "sourceTags": [],
+                "ownerTitles": [],
+                "url": url,
+            }
+            refs_by_id[video_id] = existing
+
+        source_tags = set(str(value) for value in (existing.get("sourceTags") or []) if str(value).strip())
+        source_tags.add(source_tag)
+        existing["sourceTags"] = sorted(source_tags)
+
+        owner_titles = set(str(value) for value in (existing.get("ownerTitles") or []) if str(value).strip())
+        if owner_title.strip():
+            owner_titles.add(owner_title.strip())
+        existing["ownerTitles"] = sorted(owner_titles)
+
+        if not str(existing.get("url") or "").strip() and url.strip():
+            existing["url"] = url.strip()
+
+    subscriptions_data = _fetch_site1_subscriptions_snapshot_data() or {}
+    for item in subscriptions_data.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        base_title = str(item.get("title") or "").strip()
+        base_url = str(item.get("url") or "").strip()
+
+        for sample in item.get("samples", []):
+            if not isinstance(sample, dict):
+                continue
+            add_ref(
+                sample.get("videoId"),
+                title=str(sample.get("title") or "").strip(),
+                source_tag="subscription.sample",
+                owner_title=base_title,
+                url=base_url,
+            )
+
+        for variant in item.get("variants", []):
+            if not isinstance(variant, dict):
+                continue
+            variant_id = str(variant.get("variantId") or "").strip()
+            variant_label = f"{base_title} [{variant_id}]" if variant_id else base_title
+            for sample in variant.get("samples", []):
+                if not isinstance(sample, dict):
+                    continue
+                add_ref(
+                    sample.get("videoId"),
+                    title=str(sample.get("title") or "").strip(),
+                    source_tag="subscription.variant_sample",
+                    owner_title=variant_label,
+                    url=base_url,
+                )
+
+    community_data = _fetch_site1_community_groups_snapshot_data() or {}
+    for item in community_data.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        group_title = str(item.get("title") or "").strip()
+        group_url = str(item.get("url") or "").strip()
+        add_ref(
+            item.get("nextConversationBrightCoveId"),
+            title=f"{group_title} Next Conversation".strip(),
+            source_tag="community_group.next_conversation",
+            owner_title=group_title,
+            url=group_url,
+        )
+        add_ref(
+            item.get("previousConversationBrightCoveId"),
+            title=f"{group_title} Previous Conversation".strip(),
+            source_tag="community_group.previous_conversation",
+            owner_title=group_title,
+            url=group_url,
+        )
+
+    drjoe_live_data = _fetch_site1_drjoe_live_snapshot_data() or {}
+    for item in drjoe_live_data.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        add_ref(
+            item.get("brightCoveId"),
+            title=str(item.get("title") or "").strip(),
+            source_tag="drjoe_live",
+            owner_title=str(item.get("title") or "").strip(),
+            url=str(item.get("url") or "").strip(),
+        )
+
+    items = sorted(
+        (normalize_data(value) for value in refs_by_id.values()),
+        key=lambda entry: str(entry.get("_id") or ""),
+    )
+    return {
+        "items": items,
+        "count": len(items),
     }
 
 
@@ -1010,6 +1819,341 @@ def _extract_site1_product_detail_routes_from_html(html: str) -> List[str]:
     return sorted(routes)
 
 
+def _extract_route_path(route_or_url: str) -> str:
+    parsed = urllib.parse.urlparse(str(route_or_url or "").strip())
+    return parsed.path or str(route_or_url or "").strip()
+
+
+def _load_site1_inventory_route_paths() -> set[str]:
+    """Load product-detail routes already covered by Site1 shop API trackers."""
+    covered_paths: set[str] = set()
+    for snapshot_name, items_key in (
+        ("site1_inventory_api", "products"),
+        ("site1_public_catalog_api", "items"),
+    ):
+        snapshot = load_snapshot(snapshot_name)
+        snapshot_data = snapshot.get("data", {}) if snapshot else {}
+        snapshot_products = snapshot_data.get(items_key, []) if isinstance(snapshot_data, dict) else []
+
+        for product in snapshot_products:
+            if not isinstance(product, dict):
+                continue
+            product_url = str(product.get("url") or "").strip()
+            if product_url:
+                covered_paths.add(_extract_route_path(product_url))
+
+    if covered_paths:
+        return covered_paths
+
+    current_inventory = _fetch_site1_inventory_snapshot_data()
+    if not current_inventory:
+        return covered_paths
+
+    for product in current_inventory.get("products", []):
+        if not isinstance(product, dict):
+            continue
+        product_url = str(product.get("url") or "").strip()
+        if product_url:
+            covered_paths.add(_extract_route_path(product_url))
+
+    return covered_paths
+
+
+def _extract_site2_relative_route(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path or "/"
+    prefix = "/s/Drjoedispenza"
+    if path.startswith(prefix):
+        path = path[len(prefix):] or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return path
+
+
+def _extract_site2_discovered_routes(page_url: str, page_props: Optional[Dict[str, Any]]) -> set[str]:
+    routes = {_extract_site2_relative_route(page_url)}
+    if not isinstance(page_props, dict):
+        return routes
+
+    initial_data = page_props.get("initialData", {})
+    content_store = initial_data.get("contentPageStore", {}) if isinstance(initial_data, dict) else {}
+    if not isinstance(content_store, dict):
+        return routes
+
+    seller_products = content_store.get("sellerProducts", {})
+    if isinstance(seller_products, dict):
+        for payload in seller_products.values():
+            products: List[Any] = []
+            if isinstance(payload, dict):
+                payload_list = payload.get("list")
+                if isinstance(payload_list, list):
+                    products = payload_list
+            elif isinstance(payload, list):
+                products = payload
+
+            for product in products:
+                if not isinstance(product, dict):
+                    continue
+                slug = str(product.get("slug") or "").strip().strip("/")
+                if slug:
+                    routes.add("/" + slug)
+
+    sorted_categories = content_store.get("sortedCategories", {})
+    if isinstance(sorted_categories, dict):
+        for block_id, categories in sorted_categories.items():
+            if not isinstance(categories, list):
+                continue
+            for category in categories:
+                if not isinstance(category, dict):
+                    continue
+                category_id = category.get("id")
+                if category_id is None:
+                    continue
+                routes.add(f"/produkte?block_{block_id}_group_id={category_id}")
+
+    return routes
+
+
+def _sanitize_site2_page_data_for_tracking(page_data: Any) -> Any:
+    """Remove Site2 catalog subtrees from generic page tracking to avoid duplicate alerts."""
+    if not isinstance(page_data, dict):
+        return page_data
+
+    sanitized = copy.deepcopy(page_data)
+    sanitized.pop("_sentryBaggage", None)
+    sanitized.pop("_sentryTraceData", None)
+    sanitized.pop("userSessionId", None)
+    sanitized.pop("experiments", None)
+    initial_data = sanitized.get("initialData")
+    if isinstance(initial_data, dict):
+        initial_data.pop("contentPageStore", None)
+        initial_data.pop("productsStore", None)
+
+    return sanitized
+
+
+def _extract_text_preview_from_html_fragment(html_fragment: Any) -> str:
+    if not isinstance(html_fragment, str) or not html_fragment.strip():
+        return ""
+    return _extract_text_from_body_html("<div>" + html_fragment + "</div>")
+
+
+def _extract_site2_cover_reference(covers: Any) -> str:
+    if isinstance(covers, list):
+        for cover in covers:
+            if isinstance(cover, str) and cover.strip():
+                return cover.strip()
+            if isinstance(cover, dict):
+                for key in ("url", "src", "id"):
+                    candidate = cover.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip()
+    if isinstance(covers, dict):
+        for key in ("url", "src", "id"):
+            candidate = covers.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return ""
+
+
+def _project_site2_catalog_category(block_id: str, raw_category: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_category, dict):
+        return None
+
+    category_id = raw_category.get("id")
+    if category_id is None:
+        return None
+    if str(category_id).strip() == "0":
+        # Elopage injects a localized "All products" placeholder category that
+        # flips language across requests and does not carry real membership.
+        return None
+
+    description_preview = _extract_text_preview_from_html_fragment(raw_category.get("description"))
+    route = f"/produkte?block_{block_id}_group_id={category_id}"
+
+    projected = {
+        "_id": f"{block_id}:{category_id}",
+        "title": str(raw_category.get("title") or "").strip(),
+        "descriptionPreview": description_preview,
+        "hidden": raw_category.get("hidden"),
+        "position": raw_category.get("position"),
+        "color": raw_category.get("color"),
+        "productIds": sorted(str(pid) for pid in (raw_category.get("productIds") or []) if str(pid).strip()),
+        "route": route,
+        "url": _SITE2_BASE_URL + route,
+    }
+    return normalize_data(projected)
+
+
+def _project_site2_catalog_product(raw_product: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_product, dict):
+        return None
+
+    product_id = str(raw_product.get("id") or "").strip()
+    if not product_id:
+        return None
+
+    slug = str(raw_product.get("slug") or "").strip().strip("/")
+    route = "/" + slug if slug else ""
+    description_preview = _extract_text_preview_from_html_fragment(raw_product.get("description"))
+
+    projected = {
+        "_id": product_id,
+        "title": str(raw_product.get("name") or "").strip(),
+        "slug": slug,
+        "displayPrice": raw_product.get("displayPrice"),
+        "displayOldPrice": raw_product.get("displayOldPrice"),
+        "displayCurrencyId": raw_product.get("displayCurrencyId"),
+        "free": raw_product.get("free"),
+        "private": raw_product.get("private"),
+        "coverRef": _extract_site2_cover_reference(raw_product.get("covers")),
+        "descriptionPreview": description_preview,
+        "route": route,
+        "url": (_SITE2_BASE_URL + route) if route else _SITE2_BASE_URL,
+        "categoryIds": [],
+        "categoryTitles": [],
+        "sourcePages": [],
+    }
+    return normalize_data(projected)
+
+
+def _merge_site2_catalog_product(
+    products_by_id: Dict[str, Dict[str, Any]],
+    projected_product: Dict[str, Any],
+    *,
+    source_route: str,
+    category_membership: Dict[str, set[str]],
+    category_titles_by_id: Dict[str, str],
+) -> None:
+    product_id = str(projected_product.get("_id") or "").strip()
+    if not product_id:
+        return
+
+    existing = products_by_id.get(product_id)
+    if not existing:
+        existing = copy.deepcopy(projected_product)
+        products_by_id[product_id] = existing
+
+    for field in (
+        "title",
+        "slug",
+        "displayPrice",
+        "displayOldPrice",
+        "displayCurrencyId",
+        "free",
+        "private",
+        "coverRef",
+        "descriptionPreview",
+        "route",
+        "url",
+    ):
+        current_value = existing.get(field)
+        next_value = projected_product.get(field)
+        if (current_value in (None, "", [])) and next_value not in (None, "", []):
+            existing[field] = next_value
+
+    source_pages = set(str(value) for value in (existing.get("sourcePages") or []) if str(value).strip())
+    if source_route:
+        source_pages.add(source_route)
+    existing["sourcePages"] = sorted(source_pages)
+
+    category_ids = set(str(value) for value in (existing.get("categoryIds") or []) if str(value).strip())
+    category_ids.update(category_membership.get(product_id, set()))
+    existing["categoryIds"] = sorted(category_ids)
+    existing["categoryTitles"] = sorted(
+        category_titles_by_id[category_id]
+        for category_id in category_ids
+        if category_id in category_titles_by_id and category_titles_by_id[category_id]
+    )
+
+
+def _fetch_site2_catalog_snapshot_data() -> Optional[Dict[str, Any]]:
+    build_id = ""
+    routes: set[str] = set()
+    products_by_id: Dict[str, Dict[str, Any]] = {}
+    categories_by_id: Dict[str, Dict[str, Any]] = {}
+    category_membership: Dict[str, set[str]] = {}
+    category_titles_by_id: Dict[str, str] = {}
+
+    for page_url in _SITE2_DISCOVERY_URLS:
+        html = fetch_page(page_url)
+        if not html:
+            continue
+
+        next_data = extract_next_data(html)
+        if not next_data:
+            continue
+
+        if not build_id:
+            build_id = str(next_data.get("buildId") or "").strip()
+
+        page_props = get_nested_value(next_data, "props.pageProps")
+        routes.update(_extract_site2_discovered_routes(page_url, page_props))
+
+        if not isinstance(page_props, dict):
+            continue
+
+        initial_data = page_props.get("initialData", {})
+        content_store = initial_data.get("contentPageStore", {}) if isinstance(initial_data, dict) else {}
+        if not isinstance(content_store, dict):
+            continue
+
+        sorted_categories = content_store.get("sortedCategories", {})
+        if isinstance(sorted_categories, dict):
+            for block_id, categories in sorted_categories.items():
+                if not isinstance(categories, list):
+                    continue
+                block_key = str(block_id)
+                for raw_category in categories:
+                    projected_category = _project_site2_catalog_category(block_key, raw_category)
+                    if not projected_category:
+                        continue
+                    category_key = str(projected_category.get("_id") or "")
+                    categories_by_id[category_key] = projected_category
+                    category_title = str(projected_category.get("title") or "").strip()
+                    if category_title:
+                        category_titles_by_id[category_key] = category_title
+                    for product_id in projected_category.get("productIds", []):
+                        category_membership.setdefault(str(product_id), set()).add(category_key)
+
+        seller_products = content_store.get("sellerProducts", {})
+        if isinstance(seller_products, dict):
+            for payload in seller_products.values():
+                products: List[Any] = []
+                if isinstance(payload, dict):
+                    payload_list = payload.get("list")
+                    if isinstance(payload_list, list):
+                        products = payload_list
+                elif isinstance(payload, list):
+                    products = payload
+
+                for raw_product in products:
+                    projected_product = _project_site2_catalog_product(raw_product)
+                    if not projected_product:
+                        continue
+                    _merge_site2_catalog_product(
+                        products_by_id,
+                        projected_product,
+                        source_route=_extract_site2_relative_route(page_url),
+                        category_membership=category_membership,
+                        category_titles_by_id=category_titles_by_id,
+                    )
+
+    if not build_id and not products_by_id and not categories_by_id and not routes:
+        return None
+
+    return {
+        "buildId": build_id,
+        "routes": sorted(routes),
+        "products": sorted(products_by_id.values(), key=lambda item: str(item.get("_id") or "")),
+        "categories": sorted(categories_by_id.values(), key=lambda item: str(item.get("_id") or "")),
+        "countProducts": len(products_by_id),
+        "countCategories": len(categories_by_id),
+    }
+
+
 # Site7 help center: filter out dynamic meta/related blocks to avoid noise.
 _SITE7_HELP_FILTER_VERSION = 2
 _SITE7_HELP_UPDATED_LINE_RE = re.compile(
@@ -1173,25 +2317,35 @@ def _save_snapshot_ascii(page_name: str, data: Dict[str, Any]) -> None:
 
 
 def get_items_by_id(data: Any) -> Dict[str, Any]:
-    """Extract items with _id or id field from data."""
-    items = {}
-    
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                item_id = item.get("_id") or item.get("id")
-                if item_id:
-                    items[item_id] = item
-    elif isinstance(data, dict):
-        # Recursively search for arrays with IDs
-        for key, value in data.items():
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        item_id = item.get("_id") or item.get("id")
-                        if item_id:
-                            items[item_id] = item
-    
+    """Extract nested items with _id or id field from JSON-like data."""
+    items: Dict[str, Any] = {}
+    visited: set[int] = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            node_identity = id(node)
+            if node_identity in visited:
+                return
+            visited.add(node_identity)
+
+            item_id = node.get("_id") or node.get("id")
+            if item_id is not None and str(item_id).strip():
+                items[str(item_id)] = node
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+        elif isinstance(node, list):
+            node_identity = id(node)
+            if node_identity in visited:
+                return
+            visited.add(node_identity)
+
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    visit(item)
+
+    visit(data)
     return items
 
 
@@ -1313,6 +2467,94 @@ def build_grouped_item_updates(
     return grouped_updates
 
 
+def _build_generic_page_update(page_name: str, old_data: Any, new_data: Any) -> List[Dict[str, Any]]:
+    """Create a fallback update when data changed but no item-level IDs were found."""
+    details_lines = ["Structured page data changed."]
+
+    if isinstance(old_data, dict) and isinstance(new_data, dict):
+        changed_keys: List[str] = []
+        for key in sorted(set(old_data.keys()) | set(new_data.keys())):
+            if normalize_data(old_data.get(key)) != normalize_data(new_data.get(key)):
+                changed_keys.append(key)
+
+        if changed_keys:
+            preview = ", ".join(f"`{key}`" for key in changed_keys[:8])
+            if len(changed_keys) > 8:
+                preview += f", ... (+{len(changed_keys) - 8} weitere)"
+            details_lines.append(f"Top-level keys: {preview}")
+
+    return [{
+        "id": page_name,
+        "field": "page_data",
+        "type": "📝 Updated: Page payload",
+        "details": "\n".join(details_lines),
+    }]
+
+
+def _track_items_snapshot(
+    *,
+    snapshot_name: str,
+    notification_name: str,
+    reference_url: str,
+    current_data: Dict[str, Any],
+    items_key: str = "items",
+) -> bool:
+    current_items = current_data.get(items_key, []) if isinstance(current_data, dict) else []
+    if not isinstance(current_items, list):
+        return False
+
+    old_snapshot = load_snapshot(snapshot_name)
+    if old_snapshot is None:
+        print(f"[snapshot] First snapshot for {snapshot_name} ({len(current_items)} item(s))")
+        _save_snapshot_ascii(snapshot_name, current_data)
+        return False
+
+    old_data = old_snapshot.get("data", {})
+    old_items = old_data.get(items_key, []) if isinstance(old_data, dict) else []
+
+    if compute_hash(old_items) == compute_hash(current_items):
+        print(f"[snapshot] No changes for {snapshot_name}")
+        return False
+
+    old_item_map = get_items_by_id(old_items)
+    new_item_map = get_items_by_id(current_items)
+    added, updated, removed = compare_items(old_item_map, new_item_map)
+    grouped_updates = build_grouped_item_updates(old_item_map, new_item_map, updated)
+
+    print(
+        f"[snapshot] Changes for {snapshot_name}: +{len(added)} "
+        f"~{len(grouped_updates)} -{len(removed)}"
+    )
+
+    if DISCORD_WEBHOOK_URL:
+        if added:
+            send_new_items_notification(
+                DISCORD_WEBHOOK_URL,
+                notification_name,
+                reference_url,
+                added,
+            )
+        if grouped_updates:
+            send_updated_items_notification(
+                DISCORD_WEBHOOK_URL,
+                notification_name,
+                reference_url,
+                grouped_updates,
+            )
+        if removed:
+            send_removed_items_notification(
+                DISCORD_WEBHOOK_URL,
+                notification_name,
+                reference_url,
+                removed,
+            )
+    else:
+        print("[snapshot] No Discord webhook configured - skipping notifications")
+
+    _save_snapshot_ascii(snapshot_name, current_data)
+    return True
+
+
 def compute_hash(data: Any) -> str:
     """Compute a hash of normalized data for quick comparison."""
     normalized = normalize_data(data)
@@ -1348,6 +2590,8 @@ def track_page(page: PageConfig) -> bool:
         if page_data is None:
             print(f"⚠️  Could not find data at path '{page.data_path}'")
             page_data = next_data  # Fall back to full data
+        if page.url.startswith(_SITE2_BASE_URL):
+            page_data = _sanitize_site2_page_data_for_tracking(page_data)
     else:
         # No Next.js data - use HTML content hash for tracking
         print(f"ℹ️  No __NEXT_DATA__ on {page.name} - using HTML tracking")
@@ -1370,6 +2614,25 @@ def track_page(page: PageConfig) -> bool:
         return False
     
     old_data = old_snapshot.get("data", {})
+
+    if page.url.startswith(_SITE2_BASE_URL) and isinstance(old_data, dict):
+        old_initial_data = old_data.get("initialData", {})
+        if (
+            ("_sentryBaggage" in old_data)
+            or ("_sentryTraceData" in old_data)
+            or ("userSessionId" in old_data)
+            or ("experiments" in old_data)
+            or (
+                isinstance(old_initial_data, dict)
+                and ("contentPageStore" in old_initial_data or "productsStore" in old_initial_data)
+            )
+        ):
+            print(
+                f"[site2] Updating generic snapshot baseline for {page.name} "
+                "to exclude transient session/catalog payload; skipping notifications this run"
+            )
+            save_snapshot(page.name, page_data)
+            return False
     
     # Quick hash comparison first
     old_hash = compute_hash(old_data)
@@ -1387,6 +2650,9 @@ def track_page(page: PageConfig) -> bool:
     
     added, updated, removed = compare_items(old_items, new_items)
     grouped_updates = build_grouped_item_updates(old_items, new_items, updated)
+    fallback_updates: List[Dict[str, Any]] = []
+    if not added and not updated and not removed:
+        fallback_updates = _build_generic_page_update(page.name, old_data, page_data)
     
     # Send notifications
     if DISCORD_WEBHOOK_URL:
@@ -1398,12 +2664,12 @@ def track_page(page: PageConfig) -> bool:
                 added
             )
         
-        if updated:
+        if grouped_updates or fallback_updates:
             send_updated_items_notification(
                 DISCORD_WEBHOOK_URL,
                 page.name,
                 page.url,
-                grouped_updates
+                grouped_updates or fallback_updates
             )
         
         if removed:
@@ -1516,7 +2782,23 @@ def track_site1_homepage_product_details() -> bool:
         return False
 
     routes = _extract_site1_product_detail_routes_from_html(html)
-    print(f"[site1] Found {len(routes)} homepage product-detail route(s)")
+    inventory_route_paths = _load_site1_inventory_route_paths()
+    if inventory_route_paths:
+        inventory_covered_routes = [
+            route for route in routes
+            if _extract_route_path(route) in inventory_route_paths
+        ]
+        if inventory_covered_routes:
+            print(
+                f"[site1] Skipping {len(inventory_covered_routes)} homepage product-detail route(s) "
+                "already covered by inventory tracking"
+            )
+        routes = [
+            route for route in routes
+            if _extract_route_path(route) not in inventory_route_paths
+        ]
+
+    print(f"[site1] Found {len(routes)} homepage-only product-detail route(s)")
 
     current_items: List[Dict[str, Any]] = []
     for route in routes:
@@ -1591,6 +2873,224 @@ def track_site1_homepage_product_details() -> bool:
 
     _save_snapshot_ascii("site1_homepage_product_details", current_data)
     return True
+
+
+def track_site1_public_catalog_api() -> bool:
+    """
+    Track the full public Site1 shop feed.
+
+    Notifications are suppressed for products already covered by the richer
+    inventory tracker, plus event products that are handled by the event preview
+    tracker.
+    """
+    print("\n[site1] Tracking: Public Catalog API")
+
+    current_data = _fetch_site1_public_catalog_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch public catalog snapshot data")
+        return False
+
+    current_items = current_data.get("items", [])
+    current_inventory_ids = _load_site1_inventory_item_ids()
+    current_data["catalogOnlyCount"] = sum(
+        1
+        for item in current_items
+        if str(item.get("_id") or "").strip() not in current_inventory_ids
+        and str(item.get("type") or "").strip() != "event"
+    )
+    print(
+        f"[site1] Public catalog returned {len(current_items)} item(s); "
+        f"{current_data['catalogOnlyCount']} catalog-only non-event item(s)"
+    )
+
+    old_snapshot = load_snapshot("site1_public_catalog_api")
+    if old_snapshot is None:
+        print(f"[site1] First public catalog snapshot ({len(current_items)} items)")
+        _save_snapshot_ascii("site1_public_catalog_api", current_data)
+        return False
+
+    old_data = old_snapshot.get("data", {})
+    old_items = old_data.get("items", []) if isinstance(old_data, dict) else []
+
+    if compute_hash(old_items) == compute_hash(current_items):
+        print("[site1] No public catalog changes")
+        return False
+
+    old_item_map = get_items_by_id(old_items)
+    new_item_map = get_items_by_id(current_items)
+    added, updated, removed = compare_items(old_item_map, new_item_map)
+    grouped_updates = build_grouped_item_updates(old_item_map, new_item_map, updated)
+
+    def should_notify(item_id: str) -> bool:
+        if not item_id or item_id in current_inventory_ids:
+            return False
+        item = new_item_map.get(item_id) or old_item_map.get(item_id) or {}
+        return str(item.get("type") or "").strip() != "event"
+
+    added_to_notify = [item for item in added if should_notify(str(item.get("_id") or item.get("id") or ""))]
+    grouped_updates_to_notify = [update for update in grouped_updates if should_notify(str(update.get("id") or ""))]
+    removed_to_notify = [
+        item for item in removed if should_notify(str(item.get("_id") or item.get("id") or ""))
+    ]
+
+    print(
+        f"[site1] Public catalog changes detected: +{len(added)} ~{len(grouped_updates)} -{len(removed)}; "
+        f"notifying +{len(added_to_notify)} ~{len(grouped_updates_to_notify)} -{len(removed_to_notify)}"
+    )
+
+    if DISCORD_WEBHOOK_URL:
+        if added_to_notify:
+            send_new_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Public-Catalog-API",
+                _SITE1_SHOP_URL,
+                added_to_notify,
+            )
+        if grouped_updates_to_notify:
+            send_updated_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Public-Catalog-API",
+                _SITE1_SHOP_URL,
+                grouped_updates_to_notify,
+            )
+        if removed_to_notify:
+            send_removed_items_notification(
+                DISCORD_WEBHOOK_URL,
+                "Site1-Public-Catalog-API",
+                _SITE1_SHOP_URL,
+                removed_to_notify,
+            )
+    else:
+        print("[site1] No Discord webhook configured - skipping notifications")
+
+    _save_snapshot_ascii("site1_public_catalog_api", current_data)
+    return True
+
+
+def track_site1_public_categories() -> bool:
+    print("\n[site1] Tracking: Public Categories")
+    current_data = _fetch_site1_public_categories_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch public category data")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_public_categories",
+        notification_name="Site1-Categories-API",
+        reference_url=_SITE1_SHOP_URL,
+        current_data=current_data,
+    )
+
+
+def track_site1_subscriptions_api() -> bool:
+    print("\n[site1] Tracking: Public Subscriptions")
+    current_data = _fetch_site1_subscriptions_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch subscription data")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_subscriptions_api",
+        notification_name="Site1-Subscriptions-API",
+        reference_url="https://drjoedispenza.com/dr-joe-live",
+        current_data=current_data,
+    )
+
+
+def track_site1_policies_api() -> bool:
+    print("\n[site1] Tracking: Public Policies")
+    current_data = _fetch_site1_policies_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch public policy data")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_policies_api",
+        notification_name="Site1-Policies-API",
+        reference_url=_SITE1_PUBLIC_POLICY_IDS[0]["reference_url"],
+        current_data=current_data,
+    )
+
+
+def track_site1_community_groups() -> bool:
+    print("\n[site1] Tracking: Community Groups")
+    current_data = _fetch_site1_community_groups_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch community group data")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_community_groups",
+        notification_name="Site1-Community-Groups",
+        reference_url="https://drjoedispenza.com/community",
+        current_data=current_data,
+    )
+
+
+def track_site1_routing_config() -> bool:
+    print("\n[site1] Tracking: Routing Config")
+    current_data = _fetch_site1_routing_config_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch routing config")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_routing_config",
+        notification_name="Site1-Routing-Config",
+        reference_url=f"{_SITE1_APP_RUNNER_BASE_URL}/routing-config",
+        current_data=current_data,
+    )
+
+
+def track_site1_media_settings() -> bool:
+    print("\n[site1] Tracking: Homepage Announcement Settings")
+    current_data = _fetch_site1_media_settings_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch homepage announcement settings")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_media_settings",
+        notification_name="Site1-Homepage-Announcement",
+        reference_url="https://drjoedispenza.com/",
+        current_data=current_data,
+    )
+
+
+def track_site1_drjoe_live_preview() -> bool:
+    print("\n[site1] Tracking: Dr Joe Live Preview")
+    current_data = _fetch_site1_drjoe_live_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch Dr Joe Live preview data")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_drjoe_live_preview",
+        notification_name="Site1-DrJoeLive-Preview",
+        reference_url="https://drjoedispenza.com/dr-joe-live",
+        current_data=current_data,
+    )
+
+
+def track_site1_event_preview() -> bool:
+    print("\n[site1] Tracking: Event Preview Products")
+    current_data = _fetch_site1_event_preview_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch event preview products")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_event_preview",
+        notification_name="Site1-Event-Preview",
+        reference_url="https://drjoedispenza.com/retreats",
+        current_data=current_data,
+    )
+
+
+def track_site1_brightcove_refs() -> bool:
+    print("\n[site1] Tracking: Brightcove Video References")
+    current_data = _fetch_site1_brightcove_refs_snapshot_data()
+    if not current_data:
+        print("[site1] Could not fetch Brightcove video references")
+        return False
+    return _track_items_snapshot(
+        snapshot_name="site1_brightcove_refs",
+        notification_name="Site1-Brightcove-Refs",
+        reference_url="https://drjoedispenza.com/dr-joe-live",
+        current_data=current_data,
+    )
 
 
 def track_mymm_app_events() -> bool:
@@ -2210,42 +3710,38 @@ def track_build_manifest() -> bool:
 def track_build_manifest_site2() -> bool:
     """Track the build manifest for Site2 (German shop)."""
     print("\n📡 Tracking: Site2 Build Manifest")
-    
-    # Get current build ID from Site2 homepage
-    html = fetch_page("https://drjoedispenza.info/s/Drjoedispenza")
-    if not html:
-        return False
-    
-    next_data = extract_next_data(html)
-    if not next_data:
-        return False
-    
-    build_id = next_data.get("buildId")
+
+    build_id = ""
+    shop_pages: set[str] = set()
+
+    for page_url in _SITE2_DISCOVERY_URLS:
+        html = fetch_page(page_url)
+        if not html:
+            continue
+
+        next_data = extract_next_data(html)
+        if not next_data:
+            continue
+
+        if not build_id:
+            build_id = str(next_data.get("buildId") or "").strip()
+
+        page_props = get_nested_value(next_data, "props.pageProps")
+        shop_pages.update(_extract_site2_discovered_routes(page_url, page_props))
+
     if not build_id:
         print("⚠️  Could not find buildId for Site2")
         return False
     
     print(f"📦 Site2 buildId: {build_id}")
     
-    # Extract shopPages from the NEXT_DATA (contains all registered pages)
-    page_props = get_nested_value(next_data, "props.pageProps")
-    shop_pages = []
-    if page_props:
-        # Try to find shopPages or similar sitemap data
-        initial_data = page_props.get("initialData", {})
-        content_store = initial_data.get("contentPageStore", {})
-        shop_pages = content_store.get("shopPages", [])
-        if not shop_pages:
-            # Fallback: extract all slugs from the data
-            shop_pages = content_store.get("allSlugs", [])
-    
     # Load previous snapshot
     old_snapshot = load_snapshot("build_manifest_site2")
     
     current_data = {
         "buildId": build_id,
-        "shopPages": sorted([str(p) for p in shop_pages]) if shop_pages else [],
-        "pageCount": len(shop_pages) if shop_pages else 0
+        "shopPages": sorted(shop_pages),
+        "pageCount": len(shop_pages),
     }
     
     if old_snapshot is None:
@@ -2345,6 +3841,138 @@ def track_build_manifest_site2() -> bool:
     return False
 
 
+def track_site2_catalog() -> bool:
+    """Track Site2 catalog products and categories via the public page payloads."""
+    print("\n[site2] Tracking: Catalog Data")
+
+    current_data = _fetch_site2_catalog_snapshot_data()
+    if not current_data:
+        print("[site2] Could not fetch Site2 catalog snapshot data")
+        return False
+
+    current_products = current_data.get("products", [])
+    current_categories = current_data.get("categories", [])
+    current_routes = current_data.get("routes", [])
+    print(
+        f"[site2] Catalog snapshot returned {len(current_products)} product(s), "
+        f"{len(current_categories)} categor(y/ies), {len(current_routes)} route(s)"
+    )
+
+    old_snapshot = load_snapshot("site2_catalog")
+    if old_snapshot is None:
+        print(
+            f"[site2] First Site2 catalog snapshot "
+            f"({len(current_products)} products / {len(current_categories)} categories)"
+        )
+        _save_snapshot_ascii("site2_catalog", current_data)
+        return False
+
+    old_data = old_snapshot.get("data", {})
+    old_products = old_data.get("products", []) if isinstance(old_data, dict) else []
+    old_categories = old_data.get("categories", []) if isinstance(old_data, dict) else []
+    old_routes = old_data.get("routes", []) if isinstance(old_data, dict) else []
+
+    if any(str(item.get("_id") or "").endswith(":0") for item in old_categories if isinstance(item, dict)):
+        print("[site2] Updating catalog baseline to drop localized placeholder category 0")
+        _save_snapshot_ascii("site2_catalog", current_data)
+        return False
+
+    products_changed = compute_hash(old_products) != compute_hash(current_products)
+    categories_changed = compute_hash(old_categories) != compute_hash(current_categories)
+    routes_changed = compute_hash(old_routes) != compute_hash(current_routes)
+
+    if not products_changed and not categories_changed and not routes_changed:
+        print("[site2] No catalog changes")
+        return False
+
+    changes_detected = products_changed or categories_changed
+
+    if products_changed:
+        old_product_items = get_items_by_id(old_products)
+        new_product_items = get_items_by_id(current_products)
+        added_products, updated_products, removed_products = compare_items(old_product_items, new_product_items)
+        grouped_product_updates = build_grouped_item_updates(
+            old_product_items,
+            new_product_items,
+            updated_products,
+        )
+
+        print(
+            f"[site2] Product changes detected: +{len(added_products)} "
+            f"~{len(grouped_product_updates)} -{len(removed_products)}"
+        )
+
+        if DISCORD_WEBHOOK_URL:
+            if added_products:
+                send_new_items_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site2-Catalog-Products",
+                    f"{_SITE2_BASE_URL}/produkte",
+                    added_products,
+                )
+            if grouped_product_updates:
+                send_updated_items_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site2-Catalog-Products",
+                    f"{_SITE2_BASE_URL}/produkte",
+                    grouped_product_updates,
+                )
+            if removed_products:
+                send_removed_items_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site2-Catalog-Products",
+                    f"{_SITE2_BASE_URL}/produkte",
+                    removed_products,
+                )
+
+    if categories_changed:
+        old_category_items = get_items_by_id(old_categories)
+        new_category_items = get_items_by_id(current_categories)
+        added_categories, updated_categories, removed_categories = compare_items(old_category_items, new_category_items)
+        grouped_category_updates = build_grouped_item_updates(
+            old_category_items,
+            new_category_items,
+            updated_categories,
+        )
+
+        print(
+            f"[site2] Category changes detected: +{len(added_categories)} "
+            f"~{len(grouped_category_updates)} -{len(removed_categories)}"
+        )
+
+        if DISCORD_WEBHOOK_URL:
+            if added_categories:
+                send_new_items_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site2-Catalog-Categories",
+                    f"{_SITE2_BASE_URL}/produkte",
+                    added_categories,
+                )
+            if grouped_category_updates:
+                send_updated_items_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site2-Catalog-Categories",
+                    f"{_SITE2_BASE_URL}/produkte",
+                    grouped_category_updates,
+                )
+            if removed_categories:
+                send_removed_items_notification(
+                    DISCORD_WEBHOOK_URL,
+                    "Site2-Catalog-Categories",
+                    f"{_SITE2_BASE_URL}/produkte",
+                    removed_categories,
+                )
+
+    if routes_changed:
+        print(
+            f"[site2] Route inventory changed: {len(old_routes)} -> {len(current_routes)} "
+            "(notification handled by Site2 build tracker)"
+        )
+
+    _save_snapshot_ascii("site2_catalog", current_data)
+    return changes_detected
+
+
 def track_sitemap_site5() -> bool:
     """Track WordPress XML sitemaps for Site5 to detect new pages."""
     print("\n📡 Tracking: Site5 XML Sitemaps")
@@ -2358,38 +3986,52 @@ def track_sitemap_site5() -> bool:
     ]
     
     all_urls = set()
+    failed_sitemaps: List[str] = []
     
     # Fetch all sitemaps and extract URLs
     for sitemap_url in sitemap_urls:
         content = fetch_page(sitemap_url)
-        if content:
-            # Extract URLs from XML
-            import re as regex
-            urls = regex.findall(r'<loc>(https?://[^<]+)</loc>', content)
-            all_urls.update(urls)
+        if not content:
+            failed_sitemaps.append(sitemap_url)
+            continue
+        # Extract URLs from XML
+        import re as regex
+        urls = regex.findall(r'<loc>(https?://[^<]+)</loc>', content)
+        all_urls.update(urls)
     
     print(f"📊 Found {len(all_urls)} total URLs in Site5 sitemaps")
     
     # Load previous snapshot
     old_snapshot = load_snapshot("sitemap_site5")
     
-    current_data = {
-        "urls": sorted(list(all_urls)),
-        "count": len(all_urls),
-        "hash": hashlib.md5(str(sorted(all_urls)).encode()).hexdigest()
-    }
-    
     if old_snapshot is None:
+        current_data = {
+            "urls": sorted(list(all_urls)),
+            "count": len(all_urls),
+            "hash": hashlib.md5(str(sorted(all_urls)).encode()).hexdigest()
+        }
         print(f"📝 First Site5 sitemap snapshot ({len(all_urls)} URLs)")
         save_snapshot("sitemap_site5", current_data)
         return False
     
     old_data = old_snapshot.get("data", {})
     old_urls = set(old_data.get("urls", []))
+    effective_urls = set(all_urls)
+    if failed_sitemaps:
+        effective_urls |= old_urls
+        print(
+            f"⚠️  {len(failed_sitemaps)} Site5 sitemap(s) failed - suppressing removals for this run"
+        )
+
+    current_data = {
+        "urls": sorted(list(effective_urls)),
+        "count": len(effective_urls),
+        "hash": hashlib.md5(str(sorted(effective_urls)).encode()).hexdigest()
+    }
     
     # Check for new/removed URLs
     new_urls = all_urls - old_urls
-    removed_urls = old_urls - all_urls
+    removed_urls = set() if failed_sitemaps else (old_urls - all_urls)
     
     changes_detected = False
     
@@ -2411,9 +4053,9 @@ def track_sitemap_site5() -> bool:
         print(f"🗑️ Removed Site5 pages: {len(removed_urls)}")
         changes_detected = True
     
-    if changes_detected:
+    if changes_detected or failed_sitemaps:
         save_snapshot("sitemap_site5", current_data)
-        return True
+        return changes_detected
     
     print("✅ No Site5 sitemap changes")
     return False
@@ -2435,37 +4077,51 @@ def track_sitemap_site4() -> bool:
     sub_sitemaps = regex.findall(r'<loc>(https?://[^<]+\.xml)</loc>', content)
     
     all_urls = set()
+    failed_sub_sitemaps: List[str] = []
     
     # Fetch each sub-sitemap and extract page URLs
     for sub_sitemap in sub_sitemaps:
         sub_content = fetch_page(sub_sitemap)
-        if sub_content:
-            urls = regex.findall(r'<loc>(https?://[^<]+)</loc>', sub_content)
-            # Filter out .xml files to get actual page URLs
-            page_urls = [u for u in urls if not u.endswith('.xml')]
-            all_urls.update(page_urls)
+        if not sub_content:
+            failed_sub_sitemaps.append(sub_sitemap)
+            continue
+        urls = regex.findall(r'<loc>(https?://[^<]+)</loc>', sub_content)
+        # Filter out .xml files to get actual page URLs
+        page_urls = [u for u in urls if not u.endswith('.xml')]
+        all_urls.update(page_urls)
     
     print(f"📊 Found {len(all_urls)} total URLs in Site4 sitemaps")
     
     # Load previous snapshot
     old_snapshot = load_snapshot("sitemap_site4")
     
-    current_data = {
-        "urls": sorted(list(all_urls)),
-        "count": len(all_urls),
-        "hash": hashlib.md5(str(sorted(all_urls)).encode()).hexdigest()
-    }
-    
     if old_snapshot is None:
+        current_data = {
+            "urls": sorted(list(all_urls)),
+            "count": len(all_urls),
+            "hash": hashlib.md5(str(sorted(all_urls)).encode()).hexdigest()
+        }
         print(f"📝 First Site4 sitemap snapshot ({len(all_urls)} URLs)")
         save_snapshot("sitemap_site4", current_data)
         return False
     
     old_data = old_snapshot.get("data", {})
     old_urls = set(old_data.get("urls", []))
+    effective_urls = set(all_urls)
+    if failed_sub_sitemaps:
+        effective_urls |= old_urls
+        print(
+            f"⚠️  {len(failed_sub_sitemaps)} Site4 sub-sitemap(s) failed - suppressing removals for this run"
+        )
+
+    current_data = {
+        "urls": sorted(list(effective_urls)),
+        "count": len(effective_urls),
+        "hash": hashlib.md5(str(sorted(effective_urls)).encode()).hexdigest()
+    }
     
     new_urls = all_urls - old_urls
-    removed_urls = old_urls - all_urls
+    removed_urls = set() if failed_sub_sitemaps else (old_urls - all_urls)
     
     changes_detected = False
     
@@ -2484,9 +4140,9 @@ def track_sitemap_site4() -> bool:
         print(f"🗑️ Removed Site4 pages: {len(removed_urls)}")
         changes_detected = True
     
-    if changes_detected:
+    if changes_detected or failed_sub_sitemaps:
         save_snapshot("sitemap_site4", current_data)
-        return True
+        return changes_detected
     
     print("✅ No Site4 sitemap changes")
     return False
@@ -2621,8 +4277,9 @@ def track_sitemap_content_site1() -> bool:
     
     all_urls = sitemap_snapshot.get("data", {}).get("urls", [])
     
-    # Filter out blogs, stories, and individual product pages (too many)
-    # Shop page already tracks all products
+    # Filter out blogs, stories, and individual product pages.
+    # Product-detail routes are intentionally handled by inventory/homepage-specific
+    # trackers so Site1 content alerts do not duplicate shop notifications.
     EXCLUDE_PATTERNS = [
         "/dr-joes-blog/",
         "/stories-of-transformation/",
@@ -2906,11 +4563,12 @@ def track_site7_helpcenter() -> bool:
                     links.add(full_url)
         return links
     
-    def crawl_site7() -> dict:
-        """Crawl the entire Site7 help center and return all discovered URLs with their content hashes."""
+    def crawl_site7() -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+        """Crawl the entire Site7 help center and return discovered pages plus failed fetches."""
         discovered = {}
         to_visit = {START_URL.rstrip("/")}
         visited = set()
+        failed_urls: List[str] = []
         
         while to_visit:
             url = to_visit.pop()
@@ -2920,6 +4578,7 @@ def track_site7_helpcenter() -> bool:
             
             html = fetch_page(url)
             if not html:
+                failed_urls.append(url)
                 continue
             
             # Extract text content for hashing
@@ -2948,13 +4607,17 @@ def track_site7_helpcenter() -> bool:
             # Rate limiting
             time.sleep(0.15)
         
-        return discovered
+        return discovered, failed_urls
     
     # Crawl the site
     print("   🔍 Crawling Site7 help center...")
-    current_pages = crawl_site7()
+    current_pages, crawl_errors = crawl_site7()
     
     print(f"   📊 Found {len(current_pages)} pages")
+    if crawl_errors:
+        print(
+            f"   ⚠️ Crawl had {len(crawl_errors)} fetch error(s) - preserving old pages and suppressing removals"
+        )
     
     if not current_pages:
         print("   ⚠️ No pages found - skipping")
@@ -2970,27 +4633,40 @@ def track_site7_helpcenter() -> bool:
             "   ℹ️ Site7-Filter geändert - Baseline wird aktualisiert, keine Content-Benachrichtigungen in diesem Lauf"
         )
     
-    current_data = {
-        "pages": current_pages,
-        "urls": sorted(current_pages.keys()),
-        "count": len(current_pages),
-        "last_crawled": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "filter_version": _SITE7_HELP_FILTER_VERSION,
-    }
-    
     if old_snapshot is None:
+        current_data = {
+            "pages": current_pages,
+            "urls": sorted(current_pages.keys()),
+            "count": len(current_pages),
+            "last_crawled": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "filter_version": _SITE7_HELP_FILTER_VERSION,
+        }
         print(f"   📝 First Site7 snapshot ({len(current_pages)} pages)")
         save_snapshot("site7_helpcenter", current_data)
         return False
     
     old_pages = old_data.get("pages", {})
     old_urls = set(old_data.get("urls", []))
-    current_urls = set(current_pages.keys())
+    effective_pages = dict(current_pages)
+    if crawl_errors:
+        for url, old_page in old_pages.items():
+            if url not in effective_pages:
+                effective_pages[url] = old_page
+    current_urls = set(effective_pages.keys())
+
+    current_data = {
+        "pages": effective_pages,
+        "urls": sorted(current_urls),
+        "count": len(current_urls),
+        "last_crawled": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "filter_version": _SITE7_HELP_FILTER_VERSION,
+    }
     
     changes_detected = False
     
     # Check for new pages
-    new_urls = current_urls - old_urls
+    fresh_current_urls = set(current_pages.keys())
+    new_urls = fresh_current_urls - old_urls
     if new_urls:
         print(f"   🆕 New Site7 pages: {len(new_urls)}")
         for url in sorted(new_urls)[:5]:
@@ -3013,7 +4689,7 @@ def track_site7_helpcenter() -> bool:
             )
     
     # Check for removed pages
-    removed_urls = old_urls - current_urls
+    removed_urls = set() if crawl_errors else (old_urls - current_urls)
     if removed_urls:
         print(f"   🗑️ Removed Site7 pages: {len(removed_urls)}")
         for url in sorted(removed_urls)[:5]:
@@ -3038,7 +4714,7 @@ def track_site7_helpcenter() -> bool:
     # Check for content changes on existing pages
     content_changes = []
     if not baseline_reset:
-        for url in current_urls & old_urls:
+        for url in fresh_current_urls & old_urls:
             old_hash = old_pages.get(url, {}).get("hash", "")
             new_hash = current_pages[url].get("hash", "")
             if old_hash and new_hash and old_hash != new_hash:
@@ -3088,7 +4764,7 @@ def track_site7_helpcenter() -> bool:
                 updates
             )
     
-    if changes_detected or baseline_reset:
+    if changes_detected or baseline_reset or crawl_errors:
         save_snapshot("site7_helpcenter", current_data)
         return changes_detected
     
@@ -3156,6 +4832,13 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"❌ Error tracking Site2 build manifest: {e}")
+
+    # Track Site2 catalog products/categories directly from the public page payloads
+    try:
+        if track_site2_catalog():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site2] Error tracking catalog data: {e}")
     
     # Track XML sitemaps for Site4 (WordPress - detects new pages)
     try:
@@ -3191,6 +4874,76 @@ def main():
             changes_detected = True
     except Exception as e:
         print(f"âŒ Error tracking Site1 inventory API: {e}")
+
+    # Track the broader public Site1 catalog feed (suppressed for inventory-covered items)
+    try:
+        if track_site1_public_catalog_api():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking public catalog API: {e}")
+
+    # Track public Site1 category metadata from the shop backend
+    try:
+        if track_site1_public_categories():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking public categories: {e}")
+
+    # Track public subscription metadata such as Dr Joe Live pricing/content
+    try:
+        if track_site1_subscriptions_api():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking subscriptions API: {e}")
+
+    # Track public policy/disclaimer content exposed by the storefront backend
+    try:
+        if track_site1_policies_api():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking policies API: {e}")
+
+    # Track public community group metadata, including Brightcove-backed conversation IDs
+    try:
+        if track_site1_community_groups():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking community groups: {e}")
+
+    # Track backend routing config for early feature/backend rollout changes
+    try:
+        if track_site1_routing_config():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking routing config: {e}")
+
+    # Track homepage announcement/banner settings exposed via public Realm data
+    try:
+        if track_site1_media_settings():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking homepage announcement settings: {e}")
+
+    # Track upcoming/live Dr Joe Live metadata before it necessarily lands in page HTML
+    try:
+        if track_site1_drjoe_live_preview():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking Dr Joe Live preview data: {e}")
+
+    # Track Brightcove video IDs exposed through public Site1 APIs
+    try:
+        if track_site1_brightcove_refs():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking Brightcove references: {e}")
+
+    # Track upcoming event products from the public Realm-backed preview feed
+    try:
+        if track_site1_event_preview():
+            changes_detected = True
+    except Exception as e:
+        print(f"[site1] Error tracking event preview products: {e}")
 
     # Track homepage-linked Site1 product-detail routes (covers non-inventory products/resources)
     try:

@@ -191,13 +191,13 @@ IGNORE_KEYS = [
     "defaultLocale",
     "isPreview",
     "notFoundSrcPage",
+    "_sentryBaggage",
+    "_sentryTraceData",
     # Site6 specific
     "viewerId",
     "sessionId",
     "sessionToken",
     "requestId",
-    # Notification-only preview fields
-    "contentPreview",
 ]
 
 # Keys that contain timestamps or session data (normalize these)
