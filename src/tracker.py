@@ -358,6 +358,8 @@ class _BodyTextExtractor(HTMLParser):
         self,
         exclude_section_headings: Optional[List[str]] = None,
         exclude_container_class_substrings: Optional[List[str]] = None,
+        exclude_container_id_substrings: Optional[List[str]] = None,
+        exclude_container_tags: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         self._parts: List[str] = []
@@ -373,6 +375,16 @@ class _BodyTextExtractor(HTMLParser):
             for s in (exclude_container_class_substrings or [])
             if s and s.strip()
         ]
+        self._exclude_id_substrings = [
+            s.strip().lower()
+            for s in (exclude_container_id_substrings or [])
+            if s and s.strip()
+        ]
+        self._exclude_tags = {
+            tag.strip().lower()
+            for tag in (exclude_container_tags or [])
+            if tag and tag.strip()
+        }
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
@@ -385,13 +397,35 @@ class _BodyTextExtractor(HTMLParser):
             self._skip_container_depth += 1
             return
 
+        if tag in self._exclude_tags:
+            self._skip_container_depth = 1
+            return
+
         if self._exclude_class_substrings:
             class_attr = None
+            id_attr = None
+            data_no_snippet = None
             for name, value in attrs:
-                if name and name.lower() == "class" and value:
-                    class_attr = value.lower()
-                    break
+                if not name or not value:
+                    continue
+                lowered_name = name.lower()
+                lowered_value = value.lower()
+                if lowered_name == "class":
+                    class_attr = lowered_value
+                elif lowered_name == "id":
+                    id_attr = lowered_value
+                elif lowered_name == "data-nosnippet":
+                    data_no_snippet = lowered_value
+
             if class_attr and any(sub in class_attr for sub in self._exclude_class_substrings):
+                self._skip_container_depth = 1
+                return
+            if self._exclude_id_substrings and id_attr and any(
+                sub in id_attr for sub in self._exclude_id_substrings
+            ):
+                self._skip_container_depth = 1
+                return
+            if data_no_snippet == "true":
                 self._skip_container_depth = 1
                 return
 
@@ -503,10 +537,14 @@ def _extract_text_from_body_html(
     *,
     exclude_section_headings: Optional[List[str]] = None,
     exclude_container_class_substrings: Optional[List[str]] = None,
+    exclude_container_id_substrings: Optional[List[str]] = None,
+    exclude_container_tags: Optional[List[str]] = None,
 ) -> str:
     extractor = _BodyTextExtractor(
         exclude_section_headings=exclude_section_headings,
         exclude_container_class_substrings=exclude_container_class_substrings,
+        exclude_container_id_substrings=exclude_container_id_substrings,
+        exclude_container_tags=exclude_container_tags,
     )
     try:
         extractor.feed(body_html)
@@ -561,12 +599,58 @@ def _extract_route_preview_text_from_html(html: str) -> str:
     return _extract_text_from_body_html(clean_body)
 
 
+_HTML_TRACKING_VERSION = 2
+_HTML_TRACKING_EXCLUDED_CLASS_SUBSTRINGS = [
+    "cookie",
+    "consent",
+    "cli-",
+    "wt-cli",
+    "gform",
+    "gfield",
+    "sharedaddy",
+    "et_pb_social_media_follow",
+    "et_pb_member_social_links",
+    "et_pb_newsletter",
+]
+_HTML_TRACKING_EXCLUDED_ID_SUBSTRINGS = [
+    "cookie",
+    "consent",
+    "cli",
+]
+_HTML_TRACKING_EXCLUDED_TAGS = [
+    "header",
+    "nav",
+    "footer",
+    "form",
+]
+
+
+def _extract_stable_html_tracking_text(html: str) -> str:
+    """Extract stable human-readable page text while excluding shell and widget noise."""
+    clean_body_html = _extract_clean_body_html(html)
+
+    main_match = re.search(r"<main[^>]*>(.*?)</main>", clean_body_html, re.DOTALL | re.IGNORECASE)
+    target_html = main_match.group(1) if main_match else clean_body_html
+
+    stable_text = _extract_text_from_body_html(
+        target_html,
+        exclude_container_class_substrings=_HTML_TRACKING_EXCLUDED_CLASS_SUBSTRINGS,
+        exclude_container_id_substrings=_HTML_TRACKING_EXCLUDED_ID_SUBSTRINGS,
+        exclude_container_tags=_HTML_TRACKING_EXCLUDED_TAGS,
+    )
+    if stable_text:
+        return stable_text
+
+    # Final fallback in case aggressive filtering stripped everything.
+    return _extract_text_from_body_html(clean_body_html)
+
+
 def _build_html_tracking_snapshot_data(html: str) -> Dict[str, Any]:
     """Build a text-based snapshot for plain HTML pages."""
-    clean_body_html = _extract_clean_body_html(html)
-    extracted_text = _extract_text_from_body_html(clean_body_html)
+    extracted_text = _extract_stable_html_tracking_text(html)
     return {
         "_trackingMode": "html_text",
+        "_trackingVersion": _HTML_TRACKING_VERSION,
         "title": _extract_title_from_html(html),
         "textHash": hashlib.md5(extracted_text.encode()).hexdigest(),
         "text": extracted_text,
@@ -2682,17 +2766,30 @@ def track_page(page: PageConfig) -> bool:
     old_data = old_snapshot.get("data", {})
 
     if (
-        isinstance(old_data, dict)
-        and old_data.get("_html_hash")
-        and isinstance(page_data, dict)
+        isinstance(page_data, dict)
         and page_data.get("_trackingMode") == "html_text"
     ):
-        print(
-            f"[html] Updating snapshot baseline for {page.name} "
-            "to text-based HTML tracking; skipping notifications this run"
-        )
-        save_snapshot(page.name, page_data)
-        return False
+        old_tracking_version = 0
+        if isinstance(old_data, dict):
+            try:
+                old_tracking_version = int(old_data.get("_trackingVersion") or 0)
+            except (TypeError, ValueError):
+                old_tracking_version = 0
+
+        if (
+            (isinstance(old_data, dict) and old_data.get("_html_hash"))
+            or (
+                isinstance(old_data, dict)
+                and old_data.get("_trackingMode") == "html_text"
+                and old_tracking_version < int(page_data.get("_trackingVersion") or 0)
+            )
+        ):
+            print(
+                f"[html] Updating snapshot baseline for {page.name} "
+                "to stable HTML text tracking; skipping notifications this run"
+            )
+            save_snapshot(page.name, page_data)
+            return False
 
     if page.url.startswith(_SITE2_BASE_URL) and isinstance(old_data, dict):
         old_initial_data = old_data.get("initialData", {})
